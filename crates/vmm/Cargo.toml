@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.102"
+kvm-bindings = "0.14.0"
+kvm-ioctls = "0.24.0"
+vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
