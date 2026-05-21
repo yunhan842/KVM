@@ -5,6 +5,7 @@
 // warning-clean build.
 #![allow(dead_code)]
 
+mod serial;
 mod stats;
 
 fn main() {
