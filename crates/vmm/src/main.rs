@@ -5,6 +5,7 @@
 // warning-clean build.
 #![allow(dead_code)]
 
+mod config;
 mod serial;
 mod stats;
 
