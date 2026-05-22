@@ -231,6 +231,9 @@ This is the milestone and the riskiest task. The stub climbs to long mode and ju
 - Create: `guest/boot.asm`
 - Create: `Makefile`
 - Modify: `.gitignore`
+- Modify: `crates/vmm/src/vcpu.rs` + `crates/vmm/src/main.rs` (guest CPUID — see note)
+
+> **Required host change discovered during bring-up:** entering long mode runs `wrmsr EFER.LME`, which `#GP`s (→ triple fault, `KVM_EXIT_SHUTDOWN`) unless the guest CPUID advertises the long-mode (`LM`) bit. KVM sets no CPUID by default, so `create_vcpu` must copy it: take `kvm: &Kvm`, then `let cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?; vcpu.set_cpuid2(&cpuid)?;` (add `use kvm_bindings::KVM_MAX_CPUID_ENTRIES;` and `Kvm` to the imports; update the `create_vcpu(&kvm, &vm_fd)` call site in `main.rs`). The spec's "vCPU init unchanged" was wrong on this point.
 
 - [ ] **Step 1: Write the boot stub**
 
