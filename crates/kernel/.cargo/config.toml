@@ -1,0 +1,8 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Static, absolute addressing: a freestanding kernel loaded at a fixed address must NOT be
+# position-independent. Without this the binary links as a PIE and emits .dynsym/.dynamic/
+# .gnu.hash sections that sort ahead of .text, pushing _start past our 0x2000 entry.
+rustflags = ["-C", "relocation-model=static"]
