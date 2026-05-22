@@ -1,7 +1,8 @@
 //! Create the vCPU in 16-bit real mode and run it until HLT, dispatching exits.
 
 use anyhow::{bail, Context, Result};
-use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
+use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::io::Write;
 
 use crate::serial::{Serial, COM1_PORT};
@@ -9,8 +10,17 @@ use crate::stats::Stats;
 use crate::vm::GUEST_LOAD_ADDR;
 
 /// Create vCPU 0 and set initial 16-bit real-mode register state.
-pub fn create_vcpu(vm_fd: &VmFd) -> Result<VcpuFd> {
+pub fn create_vcpu(kvm: &Kvm, vm_fd: &VmFd) -> Result<VcpuFd> {
     let vcpu = vm_fd.create_vcpu(0).context("KVM_CREATE_VCPU failed")?;
+
+    // Long mode requires the guest CPUID to advertise long-mode support (the LM bit,
+    // CPUID.80000001h:EDX[29]). KVM sets no CPUID by default, so copy the host's
+    // KVM-supported CPUID onto the vCPU. Without this, the guest's `wrmsr EFER.LME`
+    // raises #GP and (with no IDT) triple-faults.
+    let cpuid = kvm
+        .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+        .context("KVM_GET_SUPPORTED_CPUID failed")?;
+    vcpu.set_cpuid2(&cpuid).context("KVM_SET_CPUID2 failed")?;
 
     // Real mode with flat segments based at 0 so linear addr == offset.
     // (CR0.PE is 0 at reset, which get_sregs reflects — we leave it real mode.)

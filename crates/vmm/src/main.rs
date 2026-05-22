@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     ));
     vm::load_guest(&mem, &blob)?;
 
-    let mut vcpu = vcpu::create_vcpu(&vm_fd)?;
+    let mut vcpu = vcpu::create_vcpu(&kvm, &vm_fd)?;
     log("[host] created vCPU 0");
 
     let stdout = io::stdout();
