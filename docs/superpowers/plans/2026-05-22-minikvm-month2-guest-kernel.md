@@ -68,6 +68,12 @@ Create `crates/kernel/.cargo/config.toml`:
 ```toml
 [build]
 target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Static, absolute addressing: a freestanding kernel loaded at a fixed address must NOT be
+# position-independent. Without this the binary links as a PIE and emits .dynsym/.dynamic/
+# .gnu.hash sections that sort ahead of .text, pushing _start past our 0x2000 entry.
+rustflags = ["-C", "relocation-model=static"]
 ```
 
 This file is directory-scoped: it only applies when cargo is invoked from inside `crates/kernel`, so it never affects the host build of `vmm`.
@@ -101,8 +107,18 @@ SECTIONS {
     .rodata : { *(.rodata .rodata.*) }
     .data   : { *(.data .data.*) }
     .bss    : { *(.bss .bss.*) *(COMMON) }
+
+    /* Drop unwind tables (panic=abort), build notes, and toolchain comments so no
+       allocatable orphan section sorts ahead of .text and displaces our 0x2000 entry. */
+    /DISCARD/ : {
+        *(.eh_frame) *(.eh_frame_hdr)
+        *(.note .note.*)
+        *(.comment)
+    }
 }
 ```
+
+> Note: the `relocation-model=static` rustflag (Step 3) plus this `/DISCARD/` block are both required. Without them the bare target links as a PIE and places `.dynsym`/`.eh_frame` ahead of `.text`, putting the entry at `0x2080` instead of `0x2000`.
 
 - [ ] **Step 6: Write the minimal kernel**
 
