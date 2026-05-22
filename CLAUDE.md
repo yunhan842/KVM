@@ -7,12 +7,16 @@ kernel, which loads and runs freestanding C userspace programs. Full project ref
 
 ## Current phase
 
-**Month 1 — Host VMM + raw guest execution.** Build a Rust VMM that opens `/dev/kvm`,
-maps guest memory, runs one vCPU, handles serial-output + HLT exits, and prints
-`hello from guest`. Design spec:
-`docs/superpowers/specs/2026-05-20-minikvm-month1-host-vmm-design.md`.
+**Month 2 (slice 1) — Boot stub + long mode + Rust kernel.** Month 1 (host VMM + raw
+guest execution) is complete and merged. Now: a hand-written asm stub climbs
+real→protected→long mode and hands off to a `no_std` Rust kernel that builds a 64 MiB
+identity-mapped page table and prints over a polled 16550 UART. Design spec:
+`docs/superpowers/specs/2026-05-22-minikvm-month2-guest-kernel-design.md`
+(Month-1 spec retained at `docs/superpowers/specs/2026-05-20-minikvm-month1-host-vmm-design.md`).
 
 We pace by **milestones, not the calendar** — the plan's "3 months" is a learning estimate.
+This spec is the first slice of the plan's Month 2 (weeks 5–7); IDT/heap/syscalls/user mode
+are deferred to follow-on specs.
 
 ## Environment
 
@@ -57,6 +61,6 @@ design) for the eventual README.
 
 ## Next step
 
-Turn the Month-1 spec into an ordered implementation plan (workspace scaffold → open
-`/dev/kvm` → memory map → vCPU + run loop → serial → HLT → stats → `hello.asm` → tests),
-then implement test-first for the pure logic.
+Turn the Month-2 slice-1 spec into an ordered implementation plan (kernel crate scaffold →
+`boot.asm` real→long stub → Rust kernel entry + serial driver → full paging → host UART
+upgrade → Makefile/`guest.img` → tests), then implement, explaining each piece in build order.
