@@ -5,7 +5,7 @@ use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::io::Write;
 
-use crate::serial::{Serial, COM1_PORT};
+use crate::serial::{Uart, COM1_BASE, COM1_LAST};
 use crate::stats::Stats;
 use crate::vm::GUEST_LOAD_ADDR;
 
@@ -41,17 +41,25 @@ pub fn create_vcpu(kvm: &Kvm, vm_fd: &VmFd) -> Result<VcpuFd> {
 }
 
 /// Run the vCPU until HLT, forwarding serial output and counting exits.
-pub fn run<W: Write>(vcpu: &mut VcpuFd, serial: &mut Serial<W>, stats: &mut Stats) -> Result<()> {
+pub fn run<W: Write>(vcpu: &mut VcpuFd, uart: &mut Uart<W>, stats: &mut Stats) -> Result<()> {
     loop {
         match vcpu.run().context("KVM_RUN failed")? {
             VcpuExit::IoOut(port, data) => {
                 stats.record_io();
-                if port == COM1_PORT {
-                    serial.write_bytes(data);
+                if (COM1_BASE..=COM1_LAST).contains(&port) {
+                    for &b in data.iter() {
+                        uart.write_reg(port, b);
+                    }
                 }
             }
-            VcpuExit::IoIn(_, _) => {
+            VcpuExit::IoIn(port, data) => {
                 stats.record_io();
+                if (COM1_BASE..=COM1_LAST).contains(&port) {
+                    let v = uart.read_reg(port);
+                    for b in data.iter_mut() {
+                        *b = v;
+                    }
+                }
             }
             VcpuExit::MmioRead(_, _) | VcpuExit::MmioWrite(_, _) => {
                 stats.record_mmio();
