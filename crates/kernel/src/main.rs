@@ -22,11 +22,8 @@ pub extern "C" fn _start() -> ! {
     unsafe { idt::init(); }
     let _ = writeln!(com, "[guest] idt loaded");
     let _ = writeln!(com, "hello from the kernel (long mode)");
-    loop {
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack));
-        }
-    }
+    let _ = writeln!(com, "[guest] testing exception delivery (ud2)");
+    unsafe { core::arch::asm!("ud2", options(noreturn)); }
 }
 
 #[panic_handler]

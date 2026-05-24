@@ -9,7 +9,10 @@
 //! Design rationale: see docs/superpowers/specs/2026-05-24-minikvm-month2-idt-design.md
 
 use core::arch::{asm, global_asm};
+use core::fmt::Write;
 use core::ptr::addr_of_mut;
+
+use crate::serial::Serial;
 
 global_asm!(include_str!("idt_stubs.s"));
 
@@ -148,11 +151,63 @@ pub unsafe fn init() {
 
 /// Common Rust entry from `isr_common`.
 ///
-/// Placeholder for Task 1: just halt. The real implementation (context dump
-/// to serial + named exceptions) lands in Task 3 alongside the `ud2` demo.
+/// Prints a one-line context dump over COM1 and halts. Doesn't try to recover:
+/// returning to faulting code is a scheduler/syscall concern this slice doesn't
+/// own. The host sees the resulting `hlt` as KVM_EXIT_HLT and the run loop
+/// terminates normally.
 #[no_mangle]
-pub extern "C" fn rust_isr_dispatch(_ctx: &InterruptContext) -> ! {
+pub extern "C" fn rust_isr_dispatch(ctx: &InterruptContext) -> ! {
+    // Copy the fields we read into locals -- the InterruptContext is `repr(C)`
+    // (not packed), so direct field access is well-aligned, but pulling values
+    // into locals keeps the writeln! call site tidy and avoids any temptation
+    // to take a reference to a struct field across the macro expansion.
+    let vector = ctx.vector;
+    let rip = ctx.rip;
+    let rflags = ctx.rflags;
+    let err = ctx.error_code;
+
+    let mut com = Serial;
+    let _ = writeln!(
+        com,
+        "[guest] EXCEPTION {} ({}) at rip={:#x} rflags={:#x} err={:#x}",
+        vector,
+        exception_name(vector),
+        rip,
+        rflags,
+        err,
+    );
+
     loop {
         unsafe { asm!("hlt", options(nomem, nostack)); }
+    }
+}
+
+/// Map a CPU exception vector to its Intel-mnemonic name.
+/// Vectors not defined by the architecture (9, 15, 22..32) fall through to
+/// "Reserved"; they can't actually be raised this slice but the table is
+/// future-proof against accidental IRQ vectors landing in 0..32.
+fn exception_name(vector: u64) -> &'static str {
+    match vector {
+        0  => "#DE Divide Error",
+        1  => "#DB Debug",
+        2  => "NMI Non-Maskable Interrupt",
+        3  => "#BP Breakpoint",
+        4  => "#OF Overflow",
+        5  => "#BR Bound Range Exceeded",
+        6  => "#UD Invalid Opcode",
+        7  => "#NM Device Not Available",
+        8  => "#DF Double Fault",
+        10 => "#TS Invalid TSS",
+        11 => "#NP Segment Not Present",
+        12 => "#SS Stack-Segment Fault",
+        13 => "#GP General Protection",
+        14 => "#PF Page Fault",
+        16 => "#MF x87 FPU Floating-Point Error",
+        17 => "#AC Alignment Check",
+        18 => "#MC Machine Check",
+        19 => "#XM SIMD Floating-Point Exception",
+        20 => "#VE Virtualization Exception",
+        21 => "#CP Control Protection Exception",
+        _  => "Reserved",
     }
 }
