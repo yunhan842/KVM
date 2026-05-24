@@ -8,12 +8,6 @@
 //!
 //! Design rationale: see docs/superpowers/specs/2026-05-24-minikvm-month2-idt-design.md
 
-// Temporary: every item is unused until Task 2 calls `init()` from `_start`.
-// rustc 1.95.0 has a diagnostic-rendering ICE on certain dead_code warnings
-// (see devlog Month-1 entry); the workaround is the same as slice 1. Removed
-// in Task 2 once `init()` has a caller.
-#![allow(dead_code)]
-
 use core::arch::{asm, global_asm};
 use core::ptr::addr_of_mut;
 
