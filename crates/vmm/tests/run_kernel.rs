@@ -29,7 +29,9 @@ fn kernel_boots_to_long_mode_and_prints() {
     for needle in [
         "[guest] kernel entered",
         "[guest] paging enabled",
+        "[guest] idt loaded",
         "hello from the kernel",
+        "[guest] EXCEPTION 6",
         "hlt=1",
     ] {
         assert!(stdout.contains(needle), "missing '{needle}' in:\n{stdout}");

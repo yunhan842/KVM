@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod idt;
 mod io;
 mod paging;
 mod serial;
@@ -18,12 +19,11 @@ pub extern "C" fn _start() -> ! {
     let _ = writeln!(com, "[guest] kernel entered");
     unsafe { paging::init_identity_map(); }
     let _ = writeln!(com, "[guest] paging enabled");
+    unsafe { idt::init(); }
+    let _ = writeln!(com, "[guest] idt loaded");
     let _ = writeln!(com, "hello from the kernel (long mode)");
-    loop {
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack));
-        }
-    }
+    let _ = writeln!(com, "[guest] testing exception delivery (ud2)");
+    unsafe { core::arch::asm!("ud2", options(noreturn)); }
 }
 
 #[panic_handler]
