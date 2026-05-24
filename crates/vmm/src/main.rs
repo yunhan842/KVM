@@ -36,15 +36,15 @@ fn main() -> Result<()> {
     ));
     vm::load_guest(&mem, &blob)?;
 
-    let mut vcpu = vcpu::create_vcpu(&vm_fd)?;
+    let mut vcpu = vcpu::create_vcpu(&kvm, &vm_fd)?;
     log("[host] created vCPU 0");
 
     let stdout = io::stdout();
-    let mut serial = serial::Serial::new(stdout.lock());
+    let mut uart = serial::Uart::new(stdout.lock());
     let mut stats = stats::Stats::default();
 
     let start = std::time::Instant::now();
-    vcpu::run(&mut vcpu, &mut serial, &mut stats)?;
+    vcpu::run(&mut vcpu, &mut uart, &mut stats)?;
     let elapsed = start.elapsed();
 
     if cfg.trace {
