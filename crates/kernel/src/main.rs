@@ -2,6 +2,7 @@
 #![no_main]
 
 mod io;
+mod paging;
 mod serial;
 
 use core::fmt::Write;
@@ -15,7 +16,8 @@ pub extern "C" fn _start() -> ! {
     Serial::init();
     let mut com = Serial;
     let _ = writeln!(com, "[guest] kernel entered");
-    // (full paging added in Task 4 prints "[guest] paging enabled" here)
+    unsafe { paging::init_identity_map(); }
+    let _ = writeln!(com, "[guest] paging enabled");
     let _ = writeln!(com, "hello from the kernel (long mode)");
     loop {
         unsafe {
