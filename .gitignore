@@ -29,3 +29,7 @@ Cargo.lock
 
 # Windows "mark of the web" sidecar files (appear on files copied from Windows)
 *:Zone.Identifier
+
+# Local-only personal notes / AI workflow artifacts
+/docs/
+/CLAUDE.md
