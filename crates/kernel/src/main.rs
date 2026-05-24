@@ -1,22 +1,22 @@
 #![no_std]
 #![no_main]
 
+mod io;
+mod serial;
+
+use core::fmt::Write;
 use core::panic::PanicInfo;
 
-/// Write one byte to an I/O port.
-unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val,
-                     options(nomem, nostack, preserves_flags));
-}
+use serial::Serial;
 
 #[no_mangle]
 #[link_section = ".text.boot"]
 pub extern "C" fn _start() -> ! {
-    // No serial driver yet: raw-write 'K' to COM1 (the Month-1 host prints it),
-    // proving the boot stub reached 64-bit Rust. Replaced in Task 3.
-    unsafe {
-        outb(0x3f8, b'K');
-    }
+    Serial::init();
+    let mut com = Serial;
+    let _ = writeln!(com, "[guest] kernel entered");
+    // (full paging added in Task 4 prints "[guest] paging enabled" here)
+    let _ = writeln!(com, "hello from the kernel (long mode)");
     loop {
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack));
@@ -26,6 +26,8 @@ pub extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+    let mut com = Serial;
+    let _ = writeln!(com, "[guest] PANIC");
     loop {
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack));

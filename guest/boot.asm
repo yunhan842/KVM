@@ -32,10 +32,6 @@ protected:
     mov ss, ax
     mov esp, STACK_TOP
 
-    mov dx, COM1                 ; marker '1' — reached protected mode
-    mov al, '1'
-    out dx, al
-
     ; stage-1 tables: identity-map first 2 MiB via one 2 MiB huge page.
     ; (guest RAM is zeroed by KVM; write only the live entries)
     mov dword [PML4], PDPT | 0x3        ; present|writable -> PDPT
@@ -71,10 +67,6 @@ long_mode:
     mov ss, ax
     mov rsp, STACK_TOP
 
-    mov dx, COM1               ; marker '2' — reached long mode
-    mov al, '2'
-    out dx, al
-
     ; enable SSE (the Rust compiler may emit SSE instructions)
     mov rax, cr0
     and ax, 0xFFFB             ; clear CR0.EM (bit 2)
@@ -83,10 +75,6 @@ long_mode:
     mov rax, cr4
     or  rax, (1 << 9) | (1 << 10)   ; CR4.OSFXSR | CR4.OSXMMEXCPT
     mov cr4, rax
-
-    mov dx, COM1               ; marker '3' — about to enter the kernel
-    mov al, '3'
-    out dx, al
 
     mov rax, KERNEL_ENTRY
     jmp rax
