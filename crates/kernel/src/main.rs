@@ -24,6 +24,8 @@ pub extern "C" fn _start() -> ! {
     let _ = writeln!(com, "[guest] paging enabled");
     unsafe { idt::init(); }
     let _ = writeln!(com, "[guest] idt loaded");
+    unsafe { heap::init(); }
+    let _ = writeln!(com, "[guest] heap initialized ({} bytes)", heap::HEAP_SIZE);
     let _ = writeln!(com, "hello from the kernel (long mode)");
     let _ = writeln!(com, "[guest] testing exception delivery (ud2)");
     unsafe { core::arch::asm!("ud2", options(noreturn)); }

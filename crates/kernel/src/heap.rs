@@ -13,13 +13,6 @@
 //! this -- migration options are spin::Mutex, AtomicUsize CAS, or
 //! interrupt-masked alloc.
 
-// Items are unused until Task 2 calls `init()` from `_start`. The
-// `#[global_allocator]` attribute ALONE isn't enough to keep the
-// allocator's machinery live across dead-code analysis; rustc 1.95
-// also has the diagnostic-rendering ICE flagged in the devlog. Same
-// allow workaround as slices 1-2; removed in Task 2.
-#![allow(dead_code)]
-
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::addr_of_mut;
