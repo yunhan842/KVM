@@ -30,6 +30,8 @@ fn kernel_boots_to_long_mode_and_prints() {
         "[guest] kernel entered",
         "[guest] paging enabled",
         "[guest] idt loaded",
+        "[guest] heap initialized",
+        "[guest] heap demo: Vec<u32>={0,1,2,3,4} Box<u64>=0xDEADBEEF",
         "hello from the kernel",
         "[guest] EXCEPTION 6",
         "hlt=1",

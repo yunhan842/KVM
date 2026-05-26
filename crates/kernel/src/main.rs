@@ -1,6 +1,9 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod heap;
 mod idt;
 mod io;
 mod paging;
@@ -8,6 +11,8 @@ mod serial;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
+
+use alloc::{boxed::Box, vec::Vec};
 
 use serial::Serial;
 
@@ -21,6 +26,17 @@ pub extern "C" fn _start() -> ! {
     let _ = writeln!(com, "[guest] paging enabled");
     unsafe { idt::init(); }
     let _ = writeln!(com, "[guest] idt loaded");
+    unsafe { heap::init(); }
+    let _ = writeln!(com, "[guest] heap initialized ({} bytes)", heap::HEAP_SIZE);
+
+    let v: Vec<u32> = (0..5).collect();
+    let b: Box<u64> = Box::new(0xDEAD_BEEFu64);
+    let _ = writeln!(
+        com,
+        "[guest] heap demo: Vec<u32>={{{},{},{},{},{}}} Box<u64>={:#X}",
+        v[0], v[1], v[2], v[3], v[4], *b
+    );
+
     let _ = writeln!(com, "hello from the kernel (long mode)");
     let _ = writeln!(com, "[guest] testing exception delivery (ud2)");
     unsafe { core::arch::asm!("ud2", options(noreturn)); }
