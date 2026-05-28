@@ -149,6 +149,20 @@ pub unsafe fn init() {
     );
 }
 
+/// Point an installed IDT entry at an IST stack (`ist` = 1..7, or 0 for none).
+///
+/// The IST index is bits 0..3 of the byte at offset 4 within a 16-byte gate
+/// descriptor; bits 3..8 are reserved-zero (already zero from `init`'s encoder).
+/// Safe to call after `lidt`: the CPU re-reads the descriptor on each dispatch.
+///
+/// # Safety
+/// `vector` must be < 256 and the IDT must already be initialized.
+pub unsafe fn set_ist(vector: usize, ist: u8) {
+    let entries = addr_of_mut!(IDT) as *mut u8;
+    let ist_byte = entries.add(vector * 16 + 4);
+    *ist_byte = ist & 0x7;
+}
+
 /// Common Rust entry from `isr_common`.
 ///
 /// Prints a one-line context dump over COM1 and halts. Doesn't try to recover:

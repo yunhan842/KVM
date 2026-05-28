@@ -32,8 +32,10 @@ fn kernel_boots_to_long_mode_and_prints() {
         "[guest] idt loaded",
         "[guest] heap initialized",
         "[guest] heap demo: Vec<u32>={0,1,2,3,4} Box<u64>=0xDEADBEEF",
+        "[guest] gdt+tss installed",
         "hello from the kernel",
-        "[guest] EXCEPTION 6",
+        "[guest] testing #DF on IST1",
+        "[guest] EXCEPTION 8",
         "hlt=1",
     ] {
         assert!(stdout.contains(needle), "missing '{needle}' in:\n{stdout}");

@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod gdt;
 mod heap;
 mod idt;
 mod io;
@@ -37,9 +38,24 @@ pub extern "C" fn _start() -> ! {
         v[0], v[1], v[2], v[3], v[4], *b
     );
 
+    unsafe { gdt::init(); }
+    let _ = writeln!(com, "[guest] gdt+tss installed");
+
     let _ = writeln!(com, "hello from the kernel (long mode)");
-    let _ = writeln!(com, "[guest] testing exception delivery (ud2)");
-    unsafe { core::arch::asm!("ud2", options(noreturn)); }
+    let _ = writeln!(com, "[guest] testing #DF on IST1 (ud2 with unmapped RSP)");
+    // Point RSP at unmapped memory (256 MiB, past our 64 MiB map), then raise an
+    // exception. Delivering it faults trying to push the frame (#PF), and #PF on
+    // top of #PF escalates to #DF. #DF's gate has IST=1, so the CPU switches to
+    // the dedicated IST1 stack and the handler runs cleanly -- a cascade that
+    // would triple-fault before this slice.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {bad}",
+            "ud2",
+            bad = const 0x1000_0000u64,
+            options(noreturn),
+        );
+    }
 }
 
 #[panic_handler]
