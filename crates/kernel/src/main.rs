@@ -38,6 +38,9 @@ pub extern "C" fn _start() -> ! {
         v[0], v[1], v[2], v[3], v[4], *b
     );
 
+    unsafe { gdt::init(); }
+    let _ = writeln!(com, "[guest] gdt+tss installed");
+
     let _ = writeln!(com, "hello from the kernel (long mode)");
     let _ = writeln!(com, "[guest] testing exception delivery (ud2)");
     unsafe { core::arch::asm!("ud2", options(noreturn)); }

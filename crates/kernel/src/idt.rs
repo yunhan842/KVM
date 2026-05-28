@@ -157,8 +157,6 @@ pub unsafe fn init() {
 ///
 /// # Safety
 /// `vector` must be < 256 and the IDT must already be initialized.
-// Unused until gdt::init() (slice 4a Task 2) calls it.
-#[allow(dead_code)]
 pub unsafe fn set_ist(vector: usize, ist: u8) {
     let entries = addr_of_mut!(IDT) as *mut u8;
     let ist_byte = entries.add(vector * 16 + 4);

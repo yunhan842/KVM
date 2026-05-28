@@ -1,35 +1,47 @@
 //! GDT, TSS, and IST setup.
 //!
-//! Replaces the bootstrap GDT from `boot.asm` with a kernel-owned GDT that adds
-//! user-mode segments (for slice 4b's SYSCALL/SYSRET) and a TSS descriptor.
-//! Installs a 64-bit TSS with a dedicated IST stack for double faults, and
-//! points the IDT's #DF entry (vector 8) at that stack.
+//! Extends the bootstrap GDT from `boot.asm` with user-mode segments (for slice
+//! 4b's SYSCALL/SYSRET) and a TSS descriptor, installs a 64-bit TSS with a
+//! dedicated IST stack for double faults, and points the IDT's #DF entry
+//! (vector 8) at that stack.
+//!
+//! Layout note: the kernel CS/SS selectors (0x18 / 0x20) are kept IDENTICAL to
+//! boot.asm so the already-installed IDT gates (which reference 0x18) and the
+//! currently-running CS stay valid. Because no kernel selector changes, lgdt
+//! does NOT require a segment-register reload -- the cached descriptors match
+//! the new GDT slots byte-for-byte. Only `ltr` (new) and `set_ist` are needed.
 //!
 //! Design: docs/superpowers/specs/2026-05-28-minikvm-month2-gdt-tss-design.md
-
-// Every item is unused until Task 2 calls `init()` from `_start`. Same rustc
-// 1.95 dead_code ICE workaround as the earlier slices; removed in Task 2.
-#![allow(dead_code)]
 
 use core::arch::asm;
 use core::mem::size_of;
 use core::ptr::addr_of_mut;
 
 // Segment selectors = byte offsets into the GDT.
-pub const KERNEL_CS: u16 = 0x08;
-pub const KERNEL_SS: u16 = 0x10;
-pub const USER_CS32: u16 = 0x18;
-pub const USER_SS: u16 = 0x20;
-pub const USER_CS64: u16 = 0x28;
-pub const TSS_SEL: u16 = 0x30;
+// Kernel CS/SS match boot.asm. The user selectors are loaded by SYSCALL/SYSRET
+// in slice 4b; unused in 4a but documented here as the layout contract.
+#[allow(dead_code)]
+pub const KERNEL_CS: u16 = 0x18;
+#[allow(dead_code)]
+pub const KERNEL_SS: u16 = 0x20;
+#[allow(dead_code)]
+pub const USER_CS32: u16 = 0x28;
+#[allow(dead_code)]
+pub const USER_SS: u16 = 0x30;
+#[allow(dead_code)]
+pub const USER_CS64: u16 = 0x38;
+pub const TSS_SEL: u16 = 0x40;
 
 // Long-mode segment descriptors. Base/limit are vestigial (paging is
-// authoritative); only P/S/DPL/type/L bits matter.
-const KCODE: u64 = 0x00AF9A000000FFFF; // ring0 64-bit code (L=1, DPL=0)
-const KDATA: u64 = 0x00CF92000000FFFF; // ring0 data (DPL=0)
-const UCODE32: u64 = 0x00CFFA000000FFFF; // ring3 32-bit code (DPL=3)
-const UDATA: u64 = 0x00CFF2000000FFFF; // ring3 data (DPL=3)
-const UCODE64: u64 = 0x00AFFA000000FFFF; // ring3 64-bit code (L=1, DPL=3)
+// authoritative); only P/S/DPL/type/L bits matter. The first four match
+// boot.asm exactly, so swapping GDTs leaves the running CS/SS valid.
+const CODE32: u64 = 0x00CF9A000000FFFF; // 0x08 32-bit code (boot.asm, vestigial)
+const DATA32: u64 = 0x00CF92000000FFFF; // 0x10 32-bit data (boot.asm, vestigial)
+const KCODE: u64 = 0x00AF9A000000FFFF; // 0x18 kernel 64-bit code (boot.asm)
+const KDATA: u64 = 0x00AF92000000FFFF; // 0x20 kernel 64-bit data (boot.asm)
+const UCODE32: u64 = 0x00CFFA000000FFFF; // 0x28 user 32-bit code (DPL=3)
+const UDATA: u64 = 0x00CFF2000000FFFF; // 0x30 user data (DPL=3)
+const UCODE64: u64 = 0x00AFFA000000FFFF; // 0x38 user 64-bit code (DPL=3, L=1)
 
 const KERNEL_STACK_TOP: u64 = 0x100000;
 const IST_STACK_SIZE: usize = 4096;
@@ -60,13 +72,14 @@ static mut TSS: Tss = Tss {
     iopb: 0,
 };
 
-// 8 slots x 8 bytes = 64 bytes: null, kCS, kSS, uCS32, uSS, uCS64, TSS(2 slots).
+// 10 slots x 8 bytes = 80 bytes: null, c32, d32, kCS, kSS, uCS32, uSS, uCS64,
+// TSS(2 slots).
 #[repr(C, align(16))]
 struct Gdt {
-    entries: [u64; 8],
+    entries: [u64; 10],
 }
 
-static mut GDT: Gdt = Gdt { entries: [0; 8] };
+static mut GDT: Gdt = Gdt { entries: [0; 10] };
 
 #[repr(C, packed)]
 struct Gdtr {
@@ -85,7 +98,7 @@ const fn tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
     [low, high]
 }
 
-/// Build and load the new GDT + TSS + IST, and point #DF at IST1.
+/// Build and load the new GDT + TSS, and point #DF at IST1.
 ///
 /// # Safety
 /// Call once, after the IDT is installed (we mutate IDT entry 8), interrupts off.
@@ -101,51 +114,28 @@ pub unsafe fn init() {
     let tss_desc = tss_descriptor(tss as u64, (size_of::<Tss>() - 1) as u32);
     let gdt = addr_of_mut!(GDT);
     (*gdt).entries[0] = 0;
-    (*gdt).entries[1] = KCODE;
-    (*gdt).entries[2] = KDATA;
-    (*gdt).entries[3] = UCODE32;
-    (*gdt).entries[4] = UDATA;
-    (*gdt).entries[5] = UCODE64;
-    (*gdt).entries[6] = tss_desc[0];
-    (*gdt).entries[7] = tss_desc[1];
+    (*gdt).entries[1] = CODE32;
+    (*gdt).entries[2] = DATA32;
+    (*gdt).entries[3] = KCODE;
+    (*gdt).entries[4] = KDATA;
+    (*gdt).entries[5] = UCODE32;
+    (*gdt).entries[6] = UDATA;
+    (*gdt).entries[7] = UCODE64;
+    (*gdt).entries[8] = tss_desc[0];
+    (*gdt).entries[9] = tss_desc[1];
 
-    // 3. lgdt.
+    // 3. lgdt. No segment reload needed: kernel CS (0x18) / SS (0x20) keep the
+    //    same selectors AND descriptors as boot.asm, so the cached segment
+    //    descriptors stay valid against the new table.
     let gdtr = Gdtr {
         limit: (size_of::<Gdt>() - 1) as u16,
         base: gdt as u64,
     };
     asm!("lgdt [{}]", in(reg) &gdtr, options(readonly, nostack, preserves_flags));
 
-    // 4. Reload all segment registers from the new GDT.
-    reload_segments();
-
-    // 5. ltr: load the task register with the TSS selector (marks TSS busy).
+    // 4. ltr: load the task register with the TSS selector (marks TSS busy).
     asm!("ltr {0:x}", in(reg) TSS_SEL, options(nostack));
 
-    // 6. Point #DF (vector 8) at IST1.
+    // 5. Point #DF (vector 8) at IST1.
     crate::idt::set_ist(8, 1);
-}
-
-/// Reload CS via an iretq synthetic frame (the only way to load CS in long
-/// mode), then reload SS/DS/ES/FS/GS to the kernel data selector.
-#[inline(always)]
-unsafe fn reload_segments() {
-    asm!(
-        "mov rax, rsp",
-        "push {kss}",          // SS  (push reg = 8 bytes; low 16 = selector)
-        "push rax",            // RSP (round-trip the current value)
-        "pushfq",              // RFLAGS
-        "push {kcs}",          // CS
-        "lea rax, [rip + 2f]", // RIP after iretq
-        "push rax",
-        "iretq",
-        "2:",
-        "mov ds, {kss:x}",
-        "mov es, {kss:x}",
-        "mov fs, {kss:x}",
-        "mov gs, {kss:x}",
-        kss = in(reg) KERNEL_SS as u64,
-        kcs = const KERNEL_CS as i32,
-        out("rax") _,
-    );
 }
