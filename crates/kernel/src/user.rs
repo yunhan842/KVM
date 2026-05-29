@@ -8,10 +8,6 @@
 //!
 //! Design: docs/superpowers/specs/2026-05-28-minikvm-month2-syscall-ring3-design.md
 
-// Items unused until Task 4 wires `setup()` and `enter_ring3()` into `_start`.
-// Standard rustc 1.95 dead_code workaround; removed in Task 4.
-#![allow(dead_code)]
-
 use core::arch::{asm, global_asm};
 
 use crate::gdt;
@@ -35,7 +31,7 @@ user_program_start:
     mov rax, 1                       // SYS_WRITE
     mov rdi, 1                       // fd = 1 (stdout)
     lea rsi, [rip + user_msg]
-    mov rdx, msg_len                 // see .equ below
+    mov rdx, OFFSET msg_len          // OFFSET forces an immediate; see .equ + note below
     syscall
     mov rax, 2                       // SYS_EXIT
     mov rdi, 0                       // code = 0
@@ -48,7 +44,9 @@ user_program_end:
 
 // LLVM's Intel-syntax parser rejects `mov rdx, sym1 - sym2` as an immediate
 // (treats it as a memory operand). `.equ` defines a real constant the assembler
-// resolves to the same byte count (18 here) and accepts as an imm operand.
+// resolves to the same byte count (18 here), and `OFFSET sym` in the mov above
+// forces immediate semantics (otherwise LLVM emits `mov rdx, [msg_len]` —
+// a memory load from address 18, which faults from ring 3).
 .equ msg_len, user_msg_end - user_msg
 "#);
 
@@ -91,10 +89,10 @@ pub unsafe fn enter_ring3() -> ! {
         // All five operands are i32 const. PUSH imm32 sign-extends to 64; every
         // value fits signed 32-bit (0x9FFFF0 < 2^31).
         ss     = const ((gdt::USER_SS  | 3) as i32),
-        rsp    = const 0x009F_FFF0_i32,    // strictly inside PD[4]
-        rflags = const 0x2_i32,            // IF=0, bit 1 reserved-set
+        rsp    = const (USER_STACK_TOP as i32),     // strictly inside PD[4]
+        rflags = const 0x2_i32,                     // IF=0, bit 1 reserved-set
         cs     = const ((gdt::USER_CS64 | 3) as i32),
-        rip    = const 0x0080_0000_i32,    // user program entry
+        rip    = const (USER_ENTRY as i32),         // user program entry
         options(noreturn),
     );
 }

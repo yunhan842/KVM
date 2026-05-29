@@ -48,20 +48,12 @@ pub extern "C" fn _start() -> ! {
     unsafe { syscall::init(); }
     let _ = writeln!(com, "[guest] syscall enabled");
 
-    let _ = writeln!(com, "[guest] testing #DF on IST1 (ud2 with unmapped RSP)");
-    // Point RSP at unmapped memory (256 MiB, past our 64 MiB map), then raise an
-    // exception. Delivering it faults trying to push the frame (#PF), and #PF on
-    // top of #PF escalates to #DF. #DF's gate has IST=1, so the CPU switches to
-    // the dedicated IST1 stack and the handler runs cleanly -- a cascade that
-    // would triple-fault before this slice.
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, {bad}",
-            "ud2",
-            bad = const 0x1000_0000u64,
-            options(noreturn),
-        );
-    }
+    unsafe { user::setup(); }
+    let _ = writeln!(com, "[guest] entering ring 3");
+
+    // Hand control to ring 3. The user program does write(1, msg, 18) and
+    // exit(0); sys_exit halts the kernel, so this function never returns.
+    unsafe { user::enter_ring3(); }
 }
 
 #[panic_handler]
