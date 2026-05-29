@@ -43,6 +43,10 @@ pub extern "C" fn _start() -> ! {
     let _ = writeln!(com, "[guest] gdt+tss installed");
 
     let _ = writeln!(com, "hello from the kernel (long mode)");
+
+    unsafe { syscall::init(); }
+    let _ = writeln!(com, "[guest] syscall enabled");
+
     let _ = writeln!(com, "[guest] testing #DF on IST1 (ud2 with unmapped RSP)");
     // Point RSP at unmapped memory (256 MiB, past our 64 MiB map), then raise an
     // exception. Delivering it faults trying to push the frame (#PF), and #PF on

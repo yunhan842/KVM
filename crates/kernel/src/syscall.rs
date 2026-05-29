@@ -3,10 +3,6 @@
 //!
 //! Design: docs/superpowers/specs/2026-05-28-minikvm-month2-syscall-ring3-design.md
 
-// Items unused until Task 2 calls `init()` from `_start`. Same rustc 1.95
-// dead_code ICE workaround as prior slices; removed in Task 2.
-#![allow(dead_code)]
-
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
 use core::ptr::addr_of_mut;
