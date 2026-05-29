@@ -13,6 +13,7 @@ static mut PD: PageTable = PageTable([0; 512]);
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
+const USER: u64 = 1 << 2;
 const HUGE: u64 = 1 << 7;
 const PAGE_2MIB: u64 = 0x20_0000;
 
@@ -40,6 +41,37 @@ pub unsafe fn init_identity_map() {
     core::arch::asm!(
         "mov cr3, {}",
         in(reg) pml4 as u64,
+        options(nostack, preserves_flags),
+    );
+}
+
+/// Mark the 2 MiB region covered by `PD[index]` user-accessible.
+///
+/// Page permission is the AND across the walk, so the USER bit must be set on
+/// PML4[0], PDPT[0], AND the chosen PD entry. After this returns, exactly that
+/// 2 MiB region is reachable from ring 3; other PD entries lack USER and stay
+/// supervisor-only — kernel/user memory separation is real, not just CPL-based.
+///
+/// # Safety
+/// Call once for each user region, with interrupts off, after `init_identity_map`.
+/// Must NOT be called for an index whose region contains kernel data, or ring 3
+/// would gain access to it.
+pub unsafe fn map_user_pd_entry(index: usize) {
+    let pml4 = addr_of_mut!(PML4);
+    let pdpt = addr_of_mut!(PDPT);
+    let pd   = addr_of_mut!(PD);
+
+    (*pml4).0[0]      |= USER;
+    (*pdpt).0[0]      |= USER;
+    (*pd).0[index]    |= USER;
+
+    // CR3 reload: flush stale (supervisor-only) TLB entries for the touched walk
+    // levels. The user-region leaf had no prior TLB entry, but PML4[0]/PDPT[0]
+    // were cached as supervisor when kernel pages were accessed.
+    core::arch::asm!(
+        "mov rax, cr3",
+        "mov cr3, rax",
+        out("rax") _,
         options(nostack, preserves_flags),
     );
 }
