@@ -9,6 +9,7 @@ mod idt;
 mod io;
 mod paging;
 mod serial;
+mod syscall;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
