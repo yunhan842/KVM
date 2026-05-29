@@ -40,3 +40,11 @@ impl Write for Serial {
         Ok(())
     }
 }
+
+/// Write raw bytes to COM1. Used by `sys_write` to forward arbitrary user
+/// buffers (which may not be valid UTF-8, so `write_str` won't do).
+pub fn write_bytes(bytes: &[u8]) {
+    for &b in bytes {
+        Serial::write_byte(b);
+    }
+}
