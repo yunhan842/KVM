@@ -49,12 +49,14 @@ pub extern "C" fn _start() -> ! {
     unsafe { syscall::init(); }
     let _ = writeln!(com, "[guest] syscall enabled");
 
-    unsafe { user::setup(); }
+    let entry = unsafe { user::setup() };
+    let _ = writeln!(com, "[guest] loaded /bin/hello");
     let _ = writeln!(com, "[guest] entering ring 3");
 
-    // Hand control to ring 3. The user program does write(1, msg, 18) and
-    // exit(0); sys_exit halts the kernel, so this function never returns.
-    unsafe { user::enter_ring3(); }
+    // Hand control to ring 3 at the ELF entry point. The C program does
+    // write(1, "[user] hello from C userspace\n", 30) and exit(0); sys_exit
+    // halts the kernel, so this function never returns.
+    unsafe { user::enter_ring3(entry); }
 }
 
 #[panic_handler]
