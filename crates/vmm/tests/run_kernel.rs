@@ -35,8 +35,9 @@ fn kernel_boots_to_long_mode_and_prints() {
         "[guest] gdt+tss installed",
         "hello from the kernel",
         "[guest] syscall enabled",
+        "[guest] loaded /bin/hello",                   // NEW (slice 5)
         "[guest] entering ring 3",
-        "hello from ring 3",
+        "[user] hello from C userspace",               // NEW (slice 5; was "hello from ring 3")
         "[guest] user exited (code 0)",
         "hlt=1",
     ] {
