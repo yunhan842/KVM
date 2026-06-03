@@ -263,4 +263,5 @@ mod tests {
         assert_eq!(buf, &[b'H']);
         assert!(s.bench_end.is_some());
     }
+
 }
