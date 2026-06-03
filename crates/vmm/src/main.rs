@@ -41,7 +41,7 @@ fn main() -> Result<()> {
 
     let stdout = io::stdout();
     let mut uart = serial::Uart::new(stdout.lock());
-    let mut stats = stats::Stats::default();
+    let mut stats = stats::Stats::new();
 
     let start = std::time::Instant::now();
     vcpu::run(&mut vcpu, &mut uart, &mut stats)?;
@@ -49,6 +49,14 @@ fn main() -> Result<()> {
 
     if cfg.trace {
         println!("{}", stats.summary());
+        // Slice-6 benchmark line. eprintln on the failure path is intentional —
+        // the absence of the prefix on stdout is what causes the integration
+        // test to fail loudly when the benchmark didn't complete.
+        if let Some(ns) = stats.avg_syscall_ns() {
+            println!("[host] avg syscall latency: {ns} ns");
+        } else {
+            eprintln!("[host] benchmark incomplete (markers missing)");
+        }
         println!("[host] runtime: {elapsed:?}");
     }
     Ok(())
