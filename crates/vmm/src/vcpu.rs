@@ -48,7 +48,7 @@ pub fn run<W: Write>(vcpu: &mut VcpuFd, uart: &mut Uart<W>, stats: &mut Stats) -
                 stats.record_io();
                 if (COM1_BASE..=COM1_LAST).contains(&port) {
                     for &b in data.iter() {
-                        uart.write_reg(port, b);
+                        uart.write_reg(port, b, stats);
                     }
                 }
             }

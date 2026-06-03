@@ -1,2 +1,219 @@
-# KVM
-A KVM Project
+# MiniKVM
+
+A from-scratch KVM-based microVM stack in Rust, C, and x86-64 assembly.
+
+## What
+
+A Rust host VMM that opens `/dev/kvm`, allocates guest physical memory, and
+drives a single vCPU through a `KVM_RUN` loop, handling IO/HLT/MMIO exits.
+The vCPU boots a custom guest kernel: a hand-written 16-bit boot stub
+(`guest/boot.asm`) climbs real → protected → long mode, hands off to a
+freestanding Rust kernel (`crates/kernel/`) that builds its own page tables,
+IDT, GDT/TSS with IST, a bump-allocator heap, and the SYSCALL/SYSRET path.
+The kernel embeds a freestanding C program (`user/hello.c`), parses its ELF
+at runtime, and dispatches it as ring 3 — where it makes real `write` and
+`exit` syscalls back into the kernel through the assembly entry stub.
+
+End-to-end ~1500 LoC across three languages, each load-bearing.
+
+## Why
+
+- Forces understanding of every layer — host VMM, KVM API, guest boot path,
+  paging, IDT, SYSCALL machinery, ELF loading, ring transitions. You can't
+  fake any of them.
+- Each language has a load-bearing role — assembly for entry stubs and IDT
+  trampolines, Rust for VMM + guest kernel logic, C for freestanding
+  userspace. Nothing is bolted on.
+- Covers OS internals AND virtualization — a rarer combination than either
+  alone. Maps to real production work (Firecracker, Cloud Hypervisor).
+
+## Quick start
+
+```bash
+# Ubuntu 24.04 / WSL2 with /dev/kvm present:
+sudo apt install build-essential nasm
+
+# Ensure your user is in the `kvm` group (needed for /dev/kvm without sudo):
+getent group kvm | grep -q "$USER" || { sudo usermod -aG kvm "$USER"; echo "log out and back in"; }
+
+# rustup + bare-metal target:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustup target add x86_64-unknown-none
+
+# Build and run:
+make
+cargo run -p vmm -- run guest.img --trace
+```
+
+## Demo output
+
+```
+[host] created VM
+[host] mapped 64 MiB guest memory
+[host] created vCPU 0
+[guest] kernel entered
+[guest] paging enabled
+[guest] idt loaded
+[guest] heap initialized (65536 bytes)
+[guest] heap demo: Vec<u32>={0,1,2,3,4} Box<u64>=0xDEADBEEF
+[guest] gdt+tss installed
+hello from the kernel (long mode)
+[guest] syscall enabled
+[guest] loaded /bin/hello
+[guest] entering ring 3
+[user] hello from C userspace
+[guest] user exited (code 0)
+[host] VM exits: io=749, hlt=1, mmio=0
+[host] avg syscall latency: 63 ns
+[host] runtime: 13.916236ms
+```
+
+`avg syscall latency` measures the full SYSCALL/SYSRETQ round-trip through
+the kernel's asm entry stub, the Rust dispatch table, and back to ring 3
+— averaged over 10000 noop syscalls bracketed by a multi-byte protocol the
+host serial path decodes. M will vary by hardware (~50–500 ns typical).
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Linux host process (this binary)                               │
+│                                                                 │
+│  crates/vmm  (Rust, hosted)                                     │
+│   ├── opens /dev/kvm via kvm-ioctls                             │
+│   ├── creates VM, maps 64 MiB guest memory                      │
+│   ├── creates vCPU, sets initial registers                      │
+│   ├── KVM_RUN loop ── handles IO/HLT/MMIO exits                 │
+│   ├── DLAB-aware 16550 UART model → stdout                      │
+│   └── benchmark protocol (ESC B 0/1 + LE iters) → avg latency   │
+│                                                                 │
+└──────────────────────┬──────────────────────────────────────────┘
+                       │ /dev/kvm + KVM_RUN
+              ┌────────▼─────────┐
+              │  KVM (kernel)    │ VMX hardware virtualization
+              └────────┬─────────┘
+                       │ guest physical memory
+┌──────────────────────▼──────────────────────────────────────────┐
+│  Guest (single vCPU, 64 MiB RAM, identity-mapped)               │
+│                                                                 │
+│  guest/boot.asm                  ← 16-bit real → 64-bit long    │
+│   ├── lgdt (bootstrap GDT)                                      │
+│   ├── CR0.PE, CR4.PAE, CR3, EFER.LME, CR0.PG                    │
+│   ├── enable SSE                                                │
+│   └── jmp 0x2000 (kernel entry)                                 │
+│                                                                 │
+│  crates/kernel  (Rust no_std, no_main)                          │
+│   ├── paging       4-level identity map, 32× 2 MiB huge pages   │
+│   ├── idt          256-entry IDT, 32 exception trampolines      │
+│   ├── heap         64 KiB BSS, bump allocator + alloc crate     │
+│   ├── gdt          kernel GDT + TSS + IST1 stack for #DF        │
+│   ├── syscall      IA32_STAR/LSTAR/FMASK MSRs + asm entry stub  │
+│   ├── elf          ELF64 PT_LOAD parser + loader                │
+│   ├── user         embedded ring-3 ELF + iretq dispatch         │
+│   ├── serial       polling 16550 UART driver (writeln! target)  │
+│   └── io           inb/outb/rdmsr/wrmsr helpers                 │
+│                                                                 │
+│  Ring 3 (DPL=3, in PD[4] = 8–10 MiB user region, U/S=1)         │
+│   stack top at 0x9FFFF0 (last 16 B inside PD[4];                │
+│                          0xA00000 sits in PD[5], supervisor)    │
+│                                                                 │
+│  user/hello.c + user/crt0.s     ← freestanding C, no libc       │
+│   ├── benchmark protocol emitter (ESC B + LE iters; 10000 ops)  │
+│   ├── write(1, "[user] hello from C userspace\n", 30)           │
+│   └── exit(0)                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Language roles
+
+| Language       | Use                                                  | Files |
+|----------------|------------------------------------------------------|-------|
+| Assembly       | Real→long-mode boot, IDT stubs, SYSCALL stub, crt0   | `guest/boot.asm`, `crates/kernel/src/idt_stubs.s`, `crates/kernel/src/syscall_entry.s`, `user/crt0.s` |
+| Rust (hosted)  | VMM host (opens /dev/kvm, KVM_RUN loop, UART model)  | `crates/vmm/` |
+| Rust (no_std)  | Guest kernel logic above the asm stubs               | `crates/kernel/` |
+| C              | Freestanding ring-3 userspace                        | `user/hello.c` |
+
+## The slice-by-slice journey
+
+Each slice was its own design doc → branch → incremental commits → merge.
+The "at-merge demo line" was the load-bearing assertion each slice added;
+some were superseded by later slices.
+
+- **M1 — Host VMM + raw 16-bit guest** → `hello from guest`
+- **M2 slice 1 — Boot stub + long mode + Rust kernel** → `[guest] paging enabled`
+- **M2 slice 2 — IDT + 32 CPU exception handlers** → `[guest] EXCEPTION 6 (#UD ...)`
+- **M2 slice 3 — Bump allocator + `alloc` crate** → `[guest] heap demo: Vec<u32>={0,1,2,3,4} Box<u64>=0xDEADBEEF`
+- **M2 slice 4a — GDT + TSS + `#DF` on IST** → `[guest] gdt+tss installed`
+  *(at-merge marquee was `EXCEPTION 8 (#DF Double Fault)`; the provocation
+  was replaced by slice 4b's ring-3 entry sequence.)*
+- **M2 slice 4b — SYSCALL/SYSRET + ring 3** → `[guest] entering ring 3`
+  *(at-merge marquee was `hello from ring 3` written by an asm program;
+  slice 5 replaced the asm program with the C version.)*
+- **M3 slice 5 — C userspace + ELF loading** → `[user] hello from C userspace`
+- **M3 slice 6 — Benchmark + this README** → `[host] avg syscall latency: M ns`
+
+## Key lessons learned
+
+A few of the load-bearing gotchas that took the most time and would have
+been invisible without slice 2's IDT or slice 4a's IST catching them:
+
+- **The SYSRETQ +16/+8 derivation.** `IA32_STAR[63:48]` is the SYSRET *base*,
+  not the user CS directly. `SYSRETQ` computes `CS = base+16` and `SS = base+8`
+  (both with RPL forced to 3). With our GDT ordering of user CS32/SS/CS64 at
+  0x28/0x30/0x38, setting the base to `0x28` lands user CS at `0x38` and SS
+  at `0x30`. Setting it to "the obvious" `0x38` would land CS at `0x48` (past
+  the user slots, in the TSS descriptor) and `#GP`.
+- **LLVM Intel-syntax `mov reg, sym` is a memory load, not an immediate.**
+  Even after `.equ msg_len, ...`, `mov rdx, msg_len` assembles as
+  `mov rdx, [msg_len]` — a memory read from address 18. Fix:
+  `mov rdx, OFFSET msg_len`. Without slice 2's IDT, this would have been a
+  silent ring-3 triple-fault; with it, the surface area was a precise
+  `EXCEPTION 14 (#PF) at rip=0x800015 err=0x5`.
+- **GAS vs LLVM asm comment characters.** GNU `as` driving a lowercase
+  `.s` file accepts only `#` for line comments — neither `//` nor `/* */`
+  works (those are LLVM-integrated-assembler extensions the kernel's
+  `global_asm!` blocks rely on). Worth knowing when porting asm between
+  the two contexts.
+- **Ubuntu gcc 13 freestanding defaults.** `-fno-pic -fno-pie
+  -mno-red-zone -fno-stack-protector -fno-stack-clash-protection
+  -fcf-protection=none` — every flag is fighting a default-on behavior.
+  The CET (`endbr64` at every function prologue) was the most surprising.
+- **The slice-4a kernel-CS-selector preservation.** The "textbook" SYSCALL
+  GDT layout would move kernel CS to `0x08`, but slices 1–3 already run
+  with `CS=0x18` and the IDT gates hardcode that selector. The fix was
+  keeping kernel CS/SS at boot.asm's `0x18`/`0x20` and appending user
+  segments after. Caught at runtime by the first interrupt after the GDT
+  swap silently triple-faulting.
+- **`include_bytes!` path resolution.** `CARGO_MANIFEST_DIR =
+  crates/kernel/`; `../../build/hello.elf` reaches the workspace root.
+  Two `../`, not three.
+- **The 16-byte alignment contract at syscall dispatch.** SysV requires
+  the call site to be 16-byte aligned. The asm stub pushes exactly 6
+  qwords (48 bytes = 3×16) so if the kernel stack top is 16-aligned, the
+  Rust dispatcher's prologue sees the right alignment. The dedicated
+  syscall stack is `#[repr(C, align(16))]` for this reason.
+
+## References
+
+- **OSDev Wiki** — [osdev.org](https://wiki.osdev.org/) — x86_64 boot path,
+  paging, GDT, IDT.
+- **Phil Oppermann "Writing an OS in Rust"** — [os.phil-opp.com](https://os.phil-opp.com/)
+- **AMD64 APM Vol 2** — SYSCALL/SYSRET semantics, `STAR` field math.
+- **Intel SDM Vol 3A** — IDT, paging, MSRs.
+- **rust-vmm crates** — [github.com/rust-vmm](https://github.com/rust-vmm) —
+  `kvm-ioctls`, `kvm-bindings`, `vm-memory`.
+- **Linux KVM API docs** — [kernel.org/doc/html/latest/virt/kvm/api.html](https://kernel.org/doc/html/latest/virt/kvm/api.html)
+- **Firecracker** — [github.com/firecracker-microvm/firecracker](https://github.com/firecracker-microvm/firecracker)
+
+## Status
+
+Solo learning project, written May–June 2026. Pace was by milestones, not
+the calendar. Not production code.
+
+**Scope discipline** (locked from the start): single vCPU, no networking,
+no disk by design. Per-slice design rationale lives in a private notes
+tree and is not included in this clone.
+
+The repo directory is named `KVM/` for legacy reasons; the project name
+everywhere else is **MiniKVM** (mixed case).
