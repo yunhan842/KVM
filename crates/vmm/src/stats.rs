@@ -9,10 +9,10 @@ pub struct Stats {
     pub mmio_exits: u64,
 
     /// Set by the serial state machine when the start marker completes.
-    /// (`PartialEq` ignores `Instant`s because they're not comparable in a
-    /// stable way — but we don't actually use `Stats: PartialEq` in tests
-    /// that touch these fields; only the existing `counts_and_formats`
-    /// test compares Stats values.)
+    /// (`Stats: PartialEq` is derived and DOES compare these via `Instant`'s
+    /// own `PartialEq`. That's harmless in practice — only the existing
+    /// `counts_and_formats` test compares Stats values, and it never touches
+    /// the bench fields.)
     pub bench_start: Option<Instant>,
     pub bench_end: Option<Instant>,
     /// Iteration count carried in the start marker's payload (LE u64).
