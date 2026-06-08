@@ -90,7 +90,7 @@ pub fn decode_regs(hex: &str, regs: &mut kvm_regs, sregs: &mut kvm_sregs) -> Res
         return Err(StubError::ProtocolViolation);
     }
     let mut o = 0;
-    let mut take64 = |o: &mut usize| -> Result<u64, StubError> {
+    let take64 = |o: &mut usize| -> Result<u64, StubError> {
         let v = parse_hex_le_u64(&hex[*o..*o+16])?;
         *o += 16;
         Ok(v)
@@ -114,7 +114,7 @@ pub fn decode_regs(hex: &str, regs: &mut kvm_regs, sregs: &mut kvm_sregs) -> Res
     regs.rip = take64(&mut o)?;
     // EFLAGS: preserve upper 32 (architecturally reserved zero today, but
     // future-proof — see spec §8.3).
-    let mut take32 = |o: &mut usize| -> Result<u32, StubError> {
+    let take32 = |o: &mut usize| -> Result<u32, StubError> {
         let v = parse_hex_le_u32(&hex[*o..*o+8])?;
         *o += 8;
         Ok(v)
@@ -194,6 +194,67 @@ mod tests {
         assert_eq!(r2.rflags & 0xFFFF_FFFF, r.rflags & 0xFFFF_FFFF);
         // s2.cs.selector is NOT updated — selectors are no-op'd on G.
         assert_eq!(s2.cs.selector, 0);
+    }
+
+    #[test]
+    fn encode_pins_each_register_to_its_offset() {
+        // Distinct sentinel per register so a wrong offset/size is visible.
+        let mut r = zero_regs();
+        r.rax = 0x0000000000000001;
+        r.rbx = 0x0000000000000002;
+        r.rcx = 0x0000000000000003;
+        r.rdx = 0x0000000000000004;
+        r.rsi = 0x0000000000000005;
+        r.rdi = 0x0000000000000006;
+        r.rbp = 0x0000000000000007;
+        r.rsp = 0x0000000000000008;
+        r.r8  = 0x0000000000000009;
+        r.r9  = 0x000000000000000a;
+        r.r10 = 0x000000000000000b;
+        r.r11 = 0x000000000000000c;
+        r.r12 = 0x000000000000000d;
+        r.r13 = 0x000000000000000e;
+        r.r14 = 0x000000000000000f;
+        r.r15 = 0x0000000000000010;
+        r.rip = 0x0000000000000011;
+        r.rflags = 0x00000202;
+        let mut s = zero_sregs();
+        s.cs.selector = 0x0038;
+        s.ss.selector = 0x0030;
+        s.ds.selector = 0x0028;
+        s.es.selector = 0x0020;
+        s.fs.selector = 0x0018;
+        s.gs.selector = 0x0010;
+
+        let hex = encode_regs(&r, &s);
+        // Each u64 GPR occupies 16 hex chars, little-endian.
+        // rax=1 → "0100000000000000" at chars [0..16].
+        assert_eq!(&hex[0..16],   "0100000000000000", "rax @0");
+        assert_eq!(&hex[16..32],  "0200000000000000", "rbx @8");
+        assert_eq!(&hex[32..48],  "0300000000000000", "rcx @16");
+        assert_eq!(&hex[48..64],  "0400000000000000", "rdx @24");
+        assert_eq!(&hex[64..80],  "0500000000000000", "rsi @32");
+        assert_eq!(&hex[80..96],  "0600000000000000", "rdi @40");
+        assert_eq!(&hex[96..112], "0700000000000000", "rbp @48");
+        assert_eq!(&hex[112..128],"0800000000000000", "rsp @56");
+        assert_eq!(&hex[128..144],"0900000000000000", "r8 @64");
+        assert_eq!(&hex[144..160],"0a00000000000000", "r9 @72");
+        assert_eq!(&hex[160..176],"0b00000000000000", "r10 @80");
+        assert_eq!(&hex[176..192],"0c00000000000000", "r11 @88");
+        assert_eq!(&hex[192..208],"0d00000000000000", "r12 @96");
+        assert_eq!(&hex[208..224],"0e00000000000000", "r13 @104");
+        assert_eq!(&hex[224..240],"0f00000000000000", "r14 @112");
+        assert_eq!(&hex[240..256],"1000000000000000", "r15 @120");
+        assert_eq!(&hex[256..272],"1100000000000000", "rip @128");
+        // eflags u32 → 8 hex chars LE. 0x202 → "02020000".
+        assert_eq!(&hex[272..280],"02020000", "eflags @136");
+        // segment selectors u32 LE, zero-extended.
+        assert_eq!(&hex[280..288],"38000000", "cs @140");
+        assert_eq!(&hex[288..296],"30000000", "ss @144");
+        assert_eq!(&hex[296..304],"28000000", "ds @148");
+        assert_eq!(&hex[304..312],"20000000", "es @152");
+        assert_eq!(&hex[312..320],"18000000", "fs @156");
+        assert_eq!(&hex[320..328],"10000000", "gs @160");
     }
 
     #[test]

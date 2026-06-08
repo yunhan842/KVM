@@ -108,26 +108,37 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
             return Ok(DispatchAction::Reply(regs::encode_regs(&regs, &sregs).into()));
         }
         if pkt.starts_with(b"G") {
-            let hex = std::str::from_utf8(&pkt[1..])
-                .map_err(|_| StubError::ProtocolViolation)?;
+            let Ok(hex) = std::str::from_utf8(&pkt[1..]) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
             if hex.len() != regs::G_PACKET_HEX_CHARS {
                 return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
             }
             let mut regs = self.vcpu.get_regs()?;
             let mut sregs = self.vcpu.get_sregs()?;
-            regs::decode_regs(hex, &mut regs, &mut sregs)?;
+            if regs::decode_regs(hex, &mut regs, &mut sregs).is_err() {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            }
             self.vcpu.set_regs(&regs)?;
             return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("OK")));
         }
         if pkt.starts_with(b"qXfer:features:read:target.xml:") {
-            // ".:<off>,<len>" — offset and length are hex per RSP.
+            // ".:<off>,<len>" — offset and length are hex per RSP. A malformed
+            // qXfer must NOT crash the stub: reply empty (gdb's "unsupported"
+            // signal, the safe fallback for a read it can't fulfill).
             let tail = &pkt[b"qXfer:features:read:target.xml:".len()..];
-            let s = std::str::from_utf8(tail).map_err(|_| StubError::ProtocolViolation)?;
-            let (off_s, len_s) = s.split_once(',').ok_or(StubError::ProtocolViolation)?;
-            let off = usize::from_str_radix(off_s, 16)
-                .map_err(|_| StubError::ProtocolViolation)?;
-            let len = usize::from_str_radix(len_s, 16)
-                .map_err(|_| StubError::ProtocolViolation)?;
+            let Ok(s) = std::str::from_utf8(tail) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("")));
+            };
+            let Some((off_s, len_s)) = s.split_once(',') else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("")));
+            };
+            let Ok(off) = usize::from_str_radix(off_s, 16) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("")));
+            };
+            let Ok(len) = usize::from_str_radix(len_s, 16) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("")));
+            };
             return Ok(DispatchAction::Reply(regs::target_xml_chunk(off, len).into()));
         }
         // Stateful handlers (g, G, m, M, Z0, z0, c, s) come in Tasks 5/6/7.
