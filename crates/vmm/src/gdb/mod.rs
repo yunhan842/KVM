@@ -10,4 +10,208 @@ pub(crate) mod rsp;
 
 pub use errors::StubError;
 
-// Stub struct + serve entry + run_session are added in Task 4.
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+
+use anyhow::Result;
+use kvm_ioctls::VcpuFd;
+use vm_memory::GuestMemoryMmap;
+
+use crate::serial::Uart;
+use crate::stats::Stats;
+
+use packets::{DispatchAction, dispatch_stateless};
+
+/// Single-session GDB stub state. Owned by `serve`.
+///
+/// Three generic params: `'a` for the borrowed VcpuFd/mem/uart/stats,
+/// `S: Read + Write` for the gdb socket (TcpStream in production, BiCursor/etc.
+/// in tests), `W: Write` for the Uart sink (StdoutLock in production).
+pub struct Stub<'a, S: Read + Write, W: Write> {
+    pub(crate) vcpu: &'a mut VcpuFd,
+    pub(crate) mem: &'a GuestMemoryMmap,
+    #[allow(dead_code)]
+    pub(crate) uart: &'a mut Uart<W>,
+    #[allow(dead_code)]
+    pub(crate) stats: &'a mut Stats,
+    pub(crate) stream: S,
+    pub(crate) breakpoints: HashMap<u64, u8>,
+    pub(crate) noack_mode: bool,
+    pub(crate) singlestep: bool,
+}
+
+impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
+    pub fn new(
+        vcpu: &'a mut VcpuFd,
+        mem: &'a GuestMemoryMmap,
+        uart: &'a mut Uart<W>,
+        stats: &'a mut Stats,
+        stream: S,
+    ) -> Self {
+        Self {
+            vcpu,
+            mem,
+            uart,
+            stats,
+            stream,
+            breakpoints: HashMap::new(),
+            noack_mode: false,
+            singlestep: false,
+        }
+    }
+
+    /// Run the Stopped↔Running loop until D / EOF / Hlt / k.
+    /// In Task 4, only the Stopped state is implemented; Running comes in Task 7.
+    pub fn run_session(&mut self) -> Result<(), StubError> {
+        loop {
+            let pkt = match rsp::read_packet(&mut self.stream, self.noack_mode) {
+                Ok(p) => p,
+                Err(StubError::SocketDied) => {
+                    self.cleanup()?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+
+            let action = self.dispatch(&pkt)?;
+            match action {
+                DispatchAction::Reply(payload) => {
+                    rsp::write_packet(&mut self.stream, &payload, self.noack_mode)?;
+                }
+                DispatchAction::AlreadyReplied => continue,
+                DispatchAction::Resume { singlestep: _ } => {
+                    // Task 7 fills this in. For now, treat as protocol violation
+                    // to keep tests focused on Stopped-state behavior.
+                    return Err(StubError::ProtocolViolation);
+                }
+                DispatchAction::Detach => {
+                    self.cleanup()?;
+                    return Ok(());
+                }
+                DispatchAction::Kill => {
+                    self.cleanup()?;
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
+    /// Run dispatch for one packet. Folds in the QStartNoAckMode cutover.
+    fn dispatch(&mut self, pkt: &[u8]) -> Result<DispatchAction, StubError> {
+        if pkt == b"QStartNoAckMode" {
+            return self.handle_qstart_noack();
+        }
+        // Stateful handlers (g, G, m, M, Z0, z0, c, s) come in Tasks 5/6/7.
+        // For now, fall through to dispatch_stateless and reply empty for
+        // anything else.
+        if let Some(a) = dispatch_stateless(pkt) {
+            return Ok(a);
+        }
+        Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("")))
+    }
+
+    fn handle_qstart_noack(&mut self) -> Result<DispatchAction, StubError> {
+        // §6.6 five-step cutover. We're at step 1 (just received the packet).
+        // The read_packet that delivered us emitted '+' as step 2 already.
+        // Step 3: send $OK#9a, still in ack mode (so write_packet reads gdb's '+').
+        // Step 5: flip the flag only after write_packet returns successfully.
+        rsp::write_packet(&mut self.stream, "OK", false)?;
+        self.noack_mode = true;
+        Ok(DispatchAction::AlreadyReplied)
+    }
+
+    fn cleanup(&mut self) -> Result<(), StubError> {
+        // Task 7 implements memory restoration + KVM_SET_GUEST_DEBUG clear.
+        Ok(())
+    }
+}
+
+/// Connection handshake. Binds, accepts one client, runs the session.
+pub fn serve<W: Write>(
+    vcpu: &mut VcpuFd,
+    mem: &GuestMemoryMmap,
+    uart: &mut Uart<W>,
+    stats: &mut Stats,
+    port: u16,
+) -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let bound = listener.local_addr()?;
+    // stderr so the integration test can capture the line independently of stdout.
+    eprintln!(
+        "[host] gdb stub listening on 127.0.0.1:{} (waiting for client)",
+        bound.port()
+    );
+    let (stream, _) = listener.accept()?;
+    eprintln!("[host] gdb client connected");
+    let _ = stream.set_read_timeout(None);
+
+    let mut stub = Stub::new(vcpu, mem, uart, stats, stream);
+    stub.run_session().map_err(|e| match e {
+        StubError::Fatal(a) => a,
+        other => anyhow::anyhow!("unexpected StubError leak: {other:?}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor};
+
+    /// Read+Write helper for unit tests.
+    struct BiCursor {
+        inbox: Cursor<Vec<u8>>,
+        outbox: Vec<u8>,
+    }
+    impl BiCursor {
+        fn new(input: &[u8]) -> Self {
+            Self { inbox: Cursor::new(input.to_vec()), outbox: Vec::new() }
+        }
+    }
+    impl Read for BiCursor {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> { self.inbox.read(buf) }
+    }
+    impl Write for BiCursor {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.outbox.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    fn process_one_packet(input: &[u8], noack_mode: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut b = BiCursor::new(input);
+        let pkt = rsp::read_packet(&mut b, noack_mode).unwrap();
+        let action = dispatch_stateless(&pkt).expect("test packets must be stateless");
+        let DispatchAction::Reply(payload) = action else {
+            panic!("test packets must reply");
+        };
+        rsp::write_packet(&mut b, &payload, noack_mode).unwrap();
+        (b.outbox, pkt)
+    }
+
+    #[test]
+    fn session_handles_qattached_with_correct_checksum() {
+        // qAttached payload: 0x71+0x41+0x74+0x74+0x61+0x63+0x68+0x65+0x64
+        //                  = 0x38F → low byte 0x8F.
+        // In ack-mode we'd need to provide a '+' for the reply ack; use noack mode
+        // to keep the test simple (cutover happens before this in real sessions).
+        let pkt = b"$qAttached#8f";
+        let (out, _) = process_one_packet(pkt, true);
+        let s = std::str::from_utf8(&out).unwrap();
+        // payload "1" → checksum 0x31, framed as "$1#31".
+        assert_eq!(s, "$1#31");
+    }
+
+    #[test]
+    fn session_handles_question_mark() {
+        // '?' = 0x3F → checksum = 0x3F.
+        let pkt = b"$?#3f";
+        let (out, _) = process_one_packet(pkt, true);
+        let s = std::str::from_utf8(&out).unwrap();
+        // payload "T05thread:1;" — checksum hand-computed:
+        // T05thread:1; = 0x54+0x30+0x35+0x74+0x68+0x72+0x65+0x61+0x64+0x3a+0x31+0x3b
+        //              = 0x3D7 → low byte 0xD7.
+        assert_eq!(s, "$T05thread:1;#d7");
+    }
+}

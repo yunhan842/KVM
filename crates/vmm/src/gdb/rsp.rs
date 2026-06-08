@@ -91,10 +91,11 @@ pub fn write_packet<S: Read + Write>(
     payload: &str,
     noack_mode: bool,
 ) -> Result<(), StubError> {
+    // Max retransmission attempts (initial send + retries on '-' / stray bytes).
     const MAX_RETRIES: usize = 5;
     let framed = frame_packet(payload);
 
-    for _ in 0..=MAX_RETRIES {
+    for _ in 0..MAX_RETRIES {
         s.write_all(&framed)?;
         s.flush()?;
 
@@ -289,5 +290,14 @@ mod tests {
         let mut b = BiCursor::new(b"$qC#b4");
         let _ = read_packet(&mut b, true).unwrap();
         assert!(b.outbox.is_empty());
+    }
+
+    #[test]
+    fn write_packet_noack_mode_does_not_read_ack() {
+        // Empty input: write_packet must NOT attempt to read in noack mode.
+        let mut b = BiCursor::new(b"");
+        write_packet(&mut b, "OK", true).unwrap();
+        // Verify the framed packet was written.
+        assert_eq!(b.outbox, b"$OK#9a");
     }
 }
