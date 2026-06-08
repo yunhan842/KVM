@@ -67,11 +67,13 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
         loop {
             let pkt = match rsp::read_packet(&mut self.stream, self.noack_mode) {
                 Ok(p) => p,
-                Err(StubError::SocketDied) => {
+                // A dead socket OR a corrupt/oversized inbound packet means the
+                // stream is unusable; detach cleanly rather than crash the VMM.
+                Err(StubError::SocketDied) | Err(StubError::ProtocolViolation) => {
                     self.cleanup()?;
                     return Ok(());
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e), // only Fatal (KVM ioctl) reaches here
             };
 
             let action = self.dispatch(&pkt)?;
@@ -142,7 +144,10 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
             let mut buf = vec![0u8; len];
             use vm_memory::{Bytes, GuestAddress};
             self.mem.read_slice(&mut buf, GuestAddress(addr))?; // Fatal-by-design if it fails
-            let mut hex = String::with_capacity(2 * len);
+            // Capacity hint only; `len` is already bounds-checked (<= MEM_SIZE),
+            // so this cannot overflow. Use saturating_mul to keep every length
+            // multiply in the dispatch path overflow-safe by construction.
+            let mut hex = String::with_capacity(len.saturating_mul(2));
             for b in &buf {
                 hex.push_str(&format!("{:02x}", b));
             }
@@ -165,7 +170,9 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
             ) else {
                 return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
             };
-            if payload.len() != 2 * len {
+            // Overflow-safe: a `len` so large that 2*len wraps cannot match any
+            // real payload length, so treat it as a malformed write (E22).
+            if !hex_len_matches(len, payload.len()) {
                 return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
             }
             if !bounded(addr, len) {
@@ -233,6 +240,12 @@ pub(crate) fn bounded(addr: u64, len: usize) -> bool {
         Some(end) => end <= crate::vm::MEM_SIZE as u64,
         None => false,
     }
+}
+
+/// True iff `payload_hex_len` is exactly twice `len` (the M-packet contract),
+/// overflow-safe. A `len` so large that 2*len wraps returns false.
+pub(crate) fn hex_len_matches(len: usize, payload_hex_len: usize) -> bool {
+    len.checked_mul(2) == Some(payload_hex_len)
 }
 
 /// Perform the QStartNoAckMode cutover on a raw stream. Returns Ok(()) only
@@ -371,6 +384,19 @@ mod tests {
     fn bounds_overflow_rejected() {
         assert!(!bounded(u64::MAX - 4, 8));
         assert!(!bounded(u64::MAX, 1));
+    }
+
+    #[test]
+    fn hex_len_matches_normal() {
+        assert!(hex_len_matches(4, 8));       // 4 bytes = 8 hex chars
+        assert!(!hex_len_matches(4, 7));      // mismatch
+    }
+
+    #[test]
+    fn hex_len_matches_overflow_is_false() {
+        // 0x8000000000000000 * 2 overflows usize → must be false, not a panic.
+        assert!(!hex_len_matches(0x8000_0000_0000_0000, 0));
+        assert!(!hex_len_matches(usize::MAX, 0));
     }
 
     #[test]

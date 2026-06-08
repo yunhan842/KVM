@@ -10,6 +10,12 @@ use std::io::{self, Read, Write};
 
 use crate::gdb::errors::StubError;
 
+/// Maximum inbound packet payload we'll buffer before declaring the stream
+/// corrupt. We advertise PacketSize=4000 (16 KiB) to gdb; allow generous
+/// headroom for escaping/RLE, then reject. Prevents an unbounded-Vec OOM from
+/// a peer that never sends the closing '#'.
+const MAX_INBOUND_PAYLOAD: usize = 0x10000; // 64 KiB
+
 /// EINTR-resistant blocking read into a slice.
 pub fn read_exact_retry<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
     let mut filled = 0;
@@ -56,6 +62,9 @@ pub fn read_packet<S: Read + Write>(
                 break;
             }
             payload.push(byte[0]);
+            if payload.len() > MAX_INBOUND_PAYLOAD {
+                return Err(StubError::ProtocolViolation);
+            }
         }
 
         // Read 2 hex chars of checksum.
@@ -299,5 +308,17 @@ mod tests {
         write_packet(&mut b, "OK", true).unwrap();
         // Verify the framed packet was written.
         assert_eq!(b.outbox, b"$OK#9a");
+    }
+
+    #[test]
+    fn read_packet_rejects_oversized_payload() {
+        // A packet whose payload exceeds MAX_INBOUND_PAYLOAD must be rejected
+        // with ProtocolViolation rather than growing the buffer unboundedly.
+        // Build "$" + (MAX_INBOUND_PAYLOAD + 1) 'a' bytes + (no '#').
+        let mut input = vec![b'$'];
+        input.extend(std::iter::repeat(b'a').take(MAX_INBOUND_PAYLOAD + 2));
+        let mut b = BiCursor::new(&input);
+        let result = read_packet(&mut b, true);
+        assert!(matches!(result, Err(StubError::ProtocolViolation)));
     }
 }
