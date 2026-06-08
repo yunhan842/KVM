@@ -208,13 +208,9 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
             if !bounded(addr, len) {
                 return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E14")));
             }
-            let mut buf = Vec::with_capacity(len);
-            for i in 0..len {
-                let Ok(byte) = u8::from_str_radix(&payload[i * 2..i * 2 + 2], 16) else {
-                    return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
-                };
-                buf.push(byte);
-            }
+            let Some(buf) = decode_hex_bytes(payload) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
             use vm_memory::{Bytes, GuestAddress};
             self.mem.write_slice(&buf, GuestAddress(addr))?; // Fatal-by-design if it fails
             return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("OK")));
@@ -351,6 +347,24 @@ pub(crate) fn bounded(addr: u64, len: usize) -> bool {
 /// overflow-safe. A `len` so large that 2*len wraps returns false.
 pub(crate) fn hex_len_matches(len: usize, payload_hex_len: usize) -> bool {
     len.checked_mul(2) == Some(payload_hex_len)
+}
+
+/// Decode a hex string into bytes. Returns None on odd length, non-ASCII, or
+/// any non-hex digit — the caller replies E22. Panic-free: operates on bytes
+/// via chunks_exact, never &str char-boundary slicing (wire data may be valid
+/// UTF-8 multibyte, which would panic a &str byte-slice).
+pub(crate) fn decode_hex_bytes(payload: &str) -> Option<Vec<u8>> {
+    let b = payload.as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 2);
+    for pair in b.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
 }
 
 /// Stop-reply payload for a Debug exit.
@@ -551,5 +565,20 @@ mod tests {
         let mut buf = [0u8; 1];
         mem.read_slice(&mut buf, GuestAddress(0x800000)).unwrap();
         assert_eq!(buf[0], 0xCC);
+    }
+
+    #[test]
+    fn decode_hex_bytes_valid() {
+        assert_eq!(decode_hex_bytes("41ff00"), Some(vec![0x41, 0xff, 0x00]));
+        assert_eq!(decode_hex_bytes(""), Some(vec![]));
+    }
+
+    #[test]
+    fn decode_hex_bytes_rejects_non_ascii_and_bad_hex() {
+        // "Aée" = bytes 0x41 0xC3 0xA9 0x65 (the M0,2:Aée crash payload). Must
+        // be None (→ E22), never panic.
+        assert_eq!(decode_hex_bytes("Aée"), None);
+        assert_eq!(decode_hex_bytes("zz"), None);
+        assert_eq!(decode_hex_bytes("4"), None); // odd length
     }
 }

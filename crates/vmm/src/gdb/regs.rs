@@ -89,7 +89,7 @@ pub fn encode_regs(regs: &kvm_regs, sregs: &kvm_sregs) -> String {
 /// Segment selectors are SILENTLY IGNORED — see spec §8.3. We read them
 /// from the hex and discard; the caller's existing sregs values are kept.
 pub fn decode_regs(hex: &str, regs: &mut kvm_regs, sregs: &mut kvm_sregs) -> Result<(), StubError> {
-    if hex.len() != G_PACKET_HEX_CHARS {
+    if hex.len() != G_PACKET_HEX_CHARS || !hex.is_ascii() {
         return Err(StubError::ProtocolViolation);
     }
     let mut o = 0;
@@ -145,7 +145,7 @@ pub fn target_xml_chunk(offset: usize, length: usize) -> String {
         // Transfer complete — payload is exactly the byte 'l'.
         return "l".to_string();
     }
-    let end = (offset + length).min(blob.len());
+    let end = offset.saturating_add(length).min(blob.len());
     let slice = &blob[offset..end];
     let prefix = if end >= blob.len() { 'l' } else { 'm' };
     let mut s = String::with_capacity(1 + slice.len());
@@ -309,5 +309,33 @@ mod tests {
             }
         }
         assert_eq!(total_bits / 8, G_PACKET_BYTES);
+    }
+
+    #[test]
+    fn target_xml_chunk_huge_length_no_overflow() {
+        // offset in-range, length = usize::MAX: must not panic; reads to end → 'l'.
+        let chunk = target_xml_chunk(1, usize::MAX);
+        assert!(chunk.starts_with('l'));
+        // and the chunk is the rest of the blob after offset 1.
+        assert_eq!(&chunk[1..], &TARGET_XML[1..]);
+    }
+
+    #[test]
+    fn decode_regs_rejects_non_ascii_no_panic() {
+        // 326 ASCII 'a' + 'é' (2 bytes) = 328 bytes = G_PACKET_HEX_CHARS, but
+        // non-ASCII → Err, NOT a char-boundary panic.
+        let hex = "a".repeat(326) + "é";
+        assert_eq!(hex.len(), G_PACKET_HEX_CHARS);
+        let mut r = zero_regs();
+        let mut s = zero_sregs();
+        assert!(decode_regs(&hex, &mut r, &mut s).is_err());
+    }
+
+    #[test]
+    fn target_xml_is_ascii() {
+        // target_xml_chunk slices the blob at arbitrary byte offsets and
+        // from_utf8's the result; that's panic-free only if every byte is a
+        // char boundary, i.e. the blob is pure ASCII.
+        assert!(TARGET_XML.is_ascii());
     }
 }

@@ -11,7 +11,7 @@
  *
  * The DISCARD block drops sections that default-gcc/ld emit but that we
  * don't need: unwind tables (we don't use C++ exceptions), GNU notes,
- * compiler comments, GNU-specific cruft, debug sections.
+ * compiler comments, GNU-specific cruft.
  */
 
 ENTRY(_start)
