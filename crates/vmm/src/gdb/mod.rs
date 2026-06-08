@@ -114,9 +114,9 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
     fn handle_qstart_noack(&mut self) -> Result<DispatchAction, StubError> {
         // §6.6 five-step cutover. We're at step 1 (just received the packet).
         // The read_packet that delivered us emitted '+' as step 2 already.
-        // Step 3: send $OK#9a, still in ack mode (so write_packet reads gdb's '+').
-        // Step 5: flip the flag only after write_packet returns successfully.
-        rsp::write_packet(&mut self.stream, "OK", false)?;
+        // Steps 3–5 live in qstart_noack_cutover so they're unit-testable
+        // without a live VcpuFd: flip the flag only AFTER the cutover returns Ok.
+        qstart_noack_cutover(&mut self.stream)?;
         self.noack_mode = true;
         Ok(DispatchAction::AlreadyReplied)
     }
@@ -125,6 +125,17 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
         // Task 7 implements memory restoration + KVM_SET_GUEST_DEBUG clear.
         Ok(())
     }
+}
+
+/// Perform the QStartNoAckMode cutover on a raw stream. Returns Ok(()) only
+/// if the OK reply was written AND gdb acked it (write_packet in ack mode
+/// reads the trailing '+'). The caller flips its `noack_mode` flag ONLY after
+/// this returns Ok — so a write/ack failure leaves both sides in ack mode,
+/// which is the spec-mandated recovery (§6.6).
+pub(crate) fn qstart_noack_cutover<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+) -> Result<(), StubError> {
+    rsp::write_packet(stream, "OK", false)
 }
 
 /// Connection handshake. Binds, accepts one client, runs the session.
@@ -213,5 +224,25 @@ mod tests {
         // T05thread:1; = 0x54+0x30+0x35+0x74+0x68+0x72+0x65+0x61+0x64+0x3a+0x31+0x3b
         //              = 0x3D7 → low byte 0xD7.
         assert_eq!(s, "$T05thread:1;#d7");
+    }
+
+    #[test]
+    fn qstart_noack_cutover_writes_ok_then_succeeds() {
+        // write_packet in ack mode writes "$OK#9a" then reads gdb's '+' ack.
+        // Feed a '+' in the inbox so the ack-read succeeds.
+        let mut b = BiCursor::new(b"+");
+        qstart_noack_cutover(&mut b).unwrap();
+        assert_eq!(b.outbox, b"$OK#9a");
+    }
+
+    #[test]
+    fn qstart_noack_cutover_propagates_write_failure() {
+        // Empty inbox: write_packet in ack mode will block trying to read the
+        // '+' ack, then hit EOF (BiCursor returns Ok(0)) → read_exact_retry
+        // returns UnexpectedEof → StubError::SocketDied. The cutover must
+        // propagate the error so the caller does NOT flip noack_mode.
+        let mut b = BiCursor::new(b"");
+        let result = qstart_noack_cutover(&mut b);
+        assert!(result.is_err());
     }
 }

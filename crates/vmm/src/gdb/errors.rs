@@ -1,7 +1,14 @@
 //! Error type for the gdb stub.
 //!
-//! `ProtocolViolation` and `SocketDied` are handled INSIDE `run_session`
-//! and never bubble out of `gdb::serve`. Only `Fatal` escalates to anyhow.
+//! Intended contract (reached at Task 7b): `ProtocolViolation` and
+//! `SocketDied` are handled INSIDE `run_session` and never bubble out of
+//! `gdb::serve`; only `Fatal` escalates to anyhow.
+//!
+//! Transitional note (Tasks 4–7a): the `Resume` arm of `run_session` is a
+//! placeholder that returns `ProtocolViolation`, so a `c`/`s` packet sent to
+//! an intermediate build leaks it out of `serve` as an anyhow error. This is
+//! harmless because no gdb session is run against intermediate commits; Task 7b
+//! replaces the placeholder with the real Running state and closes the gap.
 
 #[derive(Debug)]
 pub enum StubError {
