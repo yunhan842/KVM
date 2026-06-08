@@ -1,4 +1,5 @@
 mod config;
+mod gdb;
 mod serial;
 mod stats;
 mod vcpu;
