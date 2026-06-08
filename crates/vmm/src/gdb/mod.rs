@@ -36,7 +36,6 @@ pub struct Stub<'a, S: Read + Write, W: Write> {
     pub(crate) stream: S,
     pub(crate) breakpoints: HashMap<u64, u8>,
     pub(crate) noack_mode: bool,
-    pub(crate) singlestep: bool,
 }
 
 impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
@@ -55,7 +54,6 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
             stream,
             breakpoints: HashMap::new(),
             noack_mode: false,
-            singlestep: false,
         }
     }
 
@@ -90,17 +88,19 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
                     };
                     // Re-arm KVM_SET_GUEST_DEBUG on EVERY resume: SINGLESTEP is
                     // a one-shot control bit that does NOT latch across runs.
-                    let mut dbg = kvm_bindings::kvm_guest_debug::default();
-                    dbg.control = KVM_GUESTDBG_ENABLE
-                        | KVM_GUESTDBG_USE_SW_BP
-                        | if singlestep { KVM_GUESTDBG_SINGLESTEP } else { 0 };
+                    let dbg = kvm_bindings::kvm_guest_debug {
+                        control: KVM_GUESTDBG_ENABLE
+                            | KVM_GUESTDBG_USE_SW_BP
+                            | if singlestep { KVM_GUESTDBG_SINGLESTEP } else { 0 },
+                        ..Default::default()
+                    };
                     self.vcpu.set_guest_debug(&dbg)?; // Fatal-by-design
 
                     match crate::vcpu::run_until_event(self.vcpu, self.uart, self.stats)
                         .map_err(StubError::Fatal)?
                     {
                         crate::vcpu::StopReason::Debug(arch) => {
-                            let payload = stop_reply_for_debug(self.vcpu, arch)?;
+                            let payload = stop_reply_for_debug(arch.exception);
                             rsp::write_packet(&mut self.stream, payload, self.noack_mode)?;
                         }
                         crate::vcpu::StopReason::Intr => {
@@ -114,6 +114,10 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
                     }
                 }
                 DispatchAction::Detach => {
+                    // gdb waits for OK after D. Best-effort: if gdb already
+                    // closed the socket, ignore the write error and still
+                    // cleanup + detach (the guest must run on).
+                    let _ = rsp::write_packet(&mut self.stream, "OK", self.noack_mode);
                     self.cleanup()?;
                     return Ok(false);
                 }
@@ -285,7 +289,6 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
                 Ok(None) => {}
                 Err(_) => return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22"))),
             }
-            self.singlestep = false;
             return Ok(DispatchAction::Resume { singlestep: false });
         }
         if pkt.starts_with(b"s") && (pkt.len() == 1 || pkt[1..].iter().all(|b| b.is_ascii_hexdigit())) {
@@ -299,7 +302,6 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
                 Ok(None) => {}
                 Err(_) => return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22"))),
             }
-            self.singlestep = true;
             return Ok(DispatchAction::Resume { singlestep: true });
         }
         // Remaining packets (?, q*, Q*, H*, v*, p, P, Z1-4, z1-4, k, D) are
@@ -351,40 +353,24 @@ pub(crate) fn hex_len_matches(len: usize, payload_hex_len: usize) -> bool {
     len.checked_mul(2) == Some(payload_hex_len)
 }
 
-/// Map a Debug exit's exception number to (stop-reply payload, RIP decrement).
+/// Stop-reply payload for a Debug exit.
 ///
-/// exception 3 = INT3 software breakpoint, exception 1 = single-step #DB.
+/// exception 3 = INT3 software breakpoint; exception 1 = single-step #DB.
 ///
-/// RIP-decrement note (verified empirically against this kernel's KVM, NOT as
-/// the design spec §9.3 predicted): with `KVM_GUESTDBG_USE_SW_BP`, KVM already
-/// rewinds RIP to the address OF the `0xCC` before the `KVM_EXIT_DEBUG` — both
-/// `kvm_regs.rip` and `kvm_debug_exit_arch.pc` equal the breakpoint address,
-/// NOT one past it. So we must NOT decrement, or gdb sees `bp_addr - 1`, never
-/// matches its breakpoint, and spins re-continuing into the same `0xCC`.
-/// (The spec's "decrement by 1" holds only for a *raw* int3 where the handler
-/// reads RIP post-trap; the USE_SW_BP path does the rewind for us.)
-/// Single-step #DB (exception 1) leaves RIP at the next instruction — no fixup.
-/// Hence the decrement is 0 for every exception.
-pub(crate) fn classify_debug(exception: u32) -> (&'static str, u64) {
+/// No RIP fixup is applied. Although INT3 is architecturally a TRAP (the
+/// pushed CS:RIP points one past the 0xCC), KVM with KVM_GUESTDBG_USE_SW_BP
+/// REWINDS the guest RIP to the int3 address before reporting KVM_EXIT_DEBUG
+/// (verified live: exception=3, pc==rip==breakpoint_addr). Because we also
+/// advertise swbreak+ and report `swbreak:`, gdb trusts our RIP as the
+/// breakpoint address and applies no heuristic of its own. So we pass RIP
+/// through unchanged. (An earlier draft decremented RIP by 1, which made gdb
+/// land at bp_addr-1 and spin forever re-hitting the breakpoint.)
+pub(crate) fn stop_reply_for_debug(exception: u32) -> &'static str {
     if exception == 3 {
-        ("T05swbreak:;thread:1;", 0)
+        "T05swbreak:;thread:1;"
     } else {
-        ("T05thread:1;", 0)
+        "T05thread:1;"
     }
-}
-
-/// Apply the RIP-1 fixup (if needed) and return the stop-reply payload.
-pub(crate) fn stop_reply_for_debug(
-    vcpu: &mut VcpuFd,
-    arch: kvm_bindings::kvm_debug_exit_arch,
-) -> Result<&'static str, StubError> {
-    let (reply, decrement) = classify_debug(arch.exception);
-    if decrement > 0 {
-        let mut regs = vcpu.get_regs()?;
-        regs.rip = regs.rip.wrapping_sub(decrement);
-        vcpu.set_regs(&regs)?;
-    }
-    Ok(reply)
 }
 
 /// Perform the QStartNoAckMode cutover on a raw stream. Returns Ok(()) only
@@ -541,27 +527,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_debug_swbp_no_decrement() {
-        // KVM_GUESTDBG_USE_SW_BP already rewinds RIP to the int3 address before
-        // the KVM_EXIT_DEBUG (verified live: pc==rip==bp_addr), so the stub must
-        // NOT decrement — doing so makes gdb spin re-hitting the same 0xCC.
-        let (reply, dec) = classify_debug(3);
-        assert_eq!(reply, "T05swbreak:;thread:1;");
-        assert_eq!(dec, 0);
+    fn stop_reply_swbp() {
+        assert_eq!(stop_reply_for_debug(3), "T05swbreak:;thread:1;");
     }
 
     #[test]
-    fn classify_debug_single_step_no_decrement() {
-        let (reply, dec) = classify_debug(1);
-        assert_eq!(reply, "T05thread:1;");
-        assert_eq!(dec, 0);
+    fn stop_reply_single_step() {
+        assert_eq!(stop_reply_for_debug(1), "T05thread:1;");
     }
 
     #[test]
-    fn classify_debug_other_exception_no_decrement() {
-        let (reply, dec) = classify_debug(0);
-        assert_eq!(reply, "T05thread:1;");
-        assert_eq!(dec, 0);
+    fn stop_reply_other_exception() {
+        assert_eq!(stop_reply_for_debug(0), "T05thread:1;");
     }
 
     #[test]

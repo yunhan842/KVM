@@ -13,6 +13,9 @@ use crate::gdb::errors::StubError;
 pub const TARGET_XML: &str = include_str!("target.xml");
 
 /// Total bytes encoded in the `g` packet (= 164). Half of `g`'s hex-char count.
+/// Laid out as: 17 eight-byte regs (16 GPRs + rip) + 1 four-byte reg (eflags)
+/// + 6 four-byte segment selectors. The `1 * 4` keeps that structure explicit.
+#[allow(clippy::identity_op)]
 pub const G_PACKET_BYTES: usize = 17 * 8 + 1 * 4 + 6 * 4;
 pub const G_PACKET_HEX_CHARS: usize = G_PACKET_BYTES * 2;
 
