@@ -102,6 +102,34 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
         if pkt == b"QStartNoAckMode" {
             return self.handle_qstart_noack();
         }
+        if pkt == b"g" {
+            let regs = self.vcpu.get_regs()?;
+            let sregs = self.vcpu.get_sregs()?;
+            return Ok(DispatchAction::Reply(regs::encode_regs(&regs, &sregs).into()));
+        }
+        if pkt.starts_with(b"G") {
+            let hex = std::str::from_utf8(&pkt[1..])
+                .map_err(|_| StubError::ProtocolViolation)?;
+            if hex.len() != regs::G_PACKET_HEX_CHARS {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            }
+            let mut regs = self.vcpu.get_regs()?;
+            let mut sregs = self.vcpu.get_sregs()?;
+            regs::decode_regs(hex, &mut regs, &mut sregs)?;
+            self.vcpu.set_regs(&regs)?;
+            return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("OK")));
+        }
+        if pkt.starts_with(b"qXfer:features:read:target.xml:") {
+            // ".:<off>,<len>" — offset and length are hex per RSP.
+            let tail = &pkt[b"qXfer:features:read:target.xml:".len()..];
+            let s = std::str::from_utf8(tail).map_err(|_| StubError::ProtocolViolation)?;
+            let (off_s, len_s) = s.split_once(',').ok_or(StubError::ProtocolViolation)?;
+            let off = usize::from_str_radix(off_s, 16)
+                .map_err(|_| StubError::ProtocolViolation)?;
+            let len = usize::from_str_radix(len_s, 16)
+                .map_err(|_| StubError::ProtocolViolation)?;
+            return Ok(DispatchAction::Reply(regs::target_xml_chunk(off, len).into()));
+        }
         // Stateful handlers (g, G, m, M, Z0, z0, c, s) come in Tasks 5/6/7.
         // For now, fall through to dispatch_stateless and reply empty for
         // anything else.
