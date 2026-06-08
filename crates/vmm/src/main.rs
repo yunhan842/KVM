@@ -8,6 +8,9 @@ mod vm;
 use anyhow::{anyhow, Result};
 use std::io;
 
+use kvm_ioctls::VcpuFd;
+use vm_memory::GuestMemoryMmap;
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = config::parse_args(&args).map_err(|e| anyhow!(e))?;
@@ -40,12 +43,17 @@ fn main() -> Result<()> {
     let mut vcpu = vcpu::create_vcpu(&kvm, &vm_fd)?;
     log("[host] created vCPU 0");
 
+    run_non_gdb_path(&mut vcpu, &mem, &cfg)
+}
+
+/// The slice-1–6 main body. Owns the vCPU loop + stats summary lines.
+fn run_non_gdb_path(vcpu: &mut VcpuFd, _mem: &GuestMemoryMmap, cfg: &config::Config) -> Result<()> {
     let stdout = io::stdout();
     let mut uart = serial::Uart::new(stdout.lock());
     let mut stats = stats::Stats::new();
 
     let start = std::time::Instant::now();
-    vcpu::run(&mut vcpu, &mut uart, &mut stats)?;
+    vcpu::run(vcpu, &mut uart, &mut stats)?;
     let elapsed = start.elapsed();
 
     if cfg.trace {
