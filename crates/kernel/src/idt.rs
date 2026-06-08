@@ -67,6 +67,22 @@ impl GateDescriptor {
             reserved:    0,
         }
     }
+
+    /// Build a present, ring-3-callable interrupt gate pointing at `handler`.
+    /// Used for vector 3 (#BP) so a CPL=3 `int3` reaches the host gdb stub
+    /// after detach (under KVM_GUESTDBG_USE_SW_BP, KVM intercepts before the
+    /// guest IDT anyway; this is belt + suspenders for the post-detach path).
+    const fn new_dpl3(handler: u64) -> Self {
+        Self {
+            offset_low:  handler as u16,
+            selector:    0x18,
+            ist:         0,
+            type_attr:   0xEE,  // P=1, DPL=3, type=0xE
+            offset_mid:  (handler >> 16) as u16,
+            offset_high: (handler >> 32) as u32,
+            reserved:    0,
+        }
+    }
 }
 
 // 256 entries x 16 bytes = 4096 bytes. 4 KiB-aligned: the physical address
@@ -133,7 +149,12 @@ pub unsafe fn init() {
     let mut i = 0usize;
     while i < 32 {
         let handler_addr = handlers[i] as usize as u64;
-        entries.add(i).write(GateDescriptor::new(handler_addr));
+        let gate = if i == 3 {
+            GateDescriptor::new_dpl3(handler_addr)
+        } else {
+            GateDescriptor::new(handler_addr)
+        };
+        entries.add(i).write(gate);
         i += 1;
     }
 

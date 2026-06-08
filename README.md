@@ -125,6 +125,65 @@ host serial path decodes. M will vary by hardware (~50–500 ns typical).
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## GDB debugging
+
+The `--gdb` flag opens a GDB Remote Serial Protocol stub on
+`127.0.0.1:1234` (override with `--gdb-port N`). The VMM blocks waiting
+for a client; once gdb attaches it stops the vCPU before the first guest
+instruction.
+
+Pre-flight (one-time per build):
+```bash
+make sanity
+```
+That confirms `build/hello.elf` carries DWARF and the kernel ELF links
+`.text` at `0x2000` (so gdb's symbol addresses match the GPA where the
+boot stub jumps).
+
+Demo session:
+```bash
+# Terminal 1
+cargo run -p vmm -- run guest.img --gdb
+# [host] gdb stub listening on 127.0.0.1:1234 (waiting for client)
+
+# Terminal 2 (run from the workspace root so `list` finds source paths)
+gdb
+(gdb) file target/x86_64-unknown-none/debug/kernel
+(gdb) add-symbol-file build/hello.elf        # NOTE: no address
+(gdb) target remote :1234
+(gdb) b kernel::syscall::rust_syscall_dispatch
+(gdb) c
+... breaks inside the kernel's syscall dispatcher
+(gdb) info registers rip rsp cs
+(gdb) p $rax                 # syscall number
+(gdb) c                      # continue; repeat to step through the noop syscalls
+(gdb) detach                 # hand the vCPU back; the guest runs to completion
+```
+
+Stock `gdb` (Ubuntu 24.04 ships 15.1) works — `gdb-multiarch` is
+unnecessary because host and guest are both x86_64.
+
+Notes:
+- `add-symbol-file build/hello.elf` takes **no address**: hello.elf is an
+  EXEC linked at `0x800000` already; passing `0x800000` would double it.
+- gdb prints `warning: Architecture rejected target-supplied description`
+  on connect. This is **harmless**: the stub serves a minimal 24-register
+  description (16 GPRs + rip + eflags + 6 segment selectors) that gdb
+  declines, falling back to its built-in `i386:x86-64` layout — which is
+  byte-compatible with our register packet, so every register reads and
+  writes correctly.
+- Software breakpoints are stub-managed: gdb's `Z0` makes the stub write
+  `0xCC` (saving the original byte) and `KVM_GUESTDBG_USE_SW_BP` traps the
+  int3. KVM rewinds RIP to the breakpoint address itself, so the stub
+  reports it unchanged (no manual fixup needed).
+- Stepping (`si`) over a `SYSCALL` appears atomic — the next stop is the
+  first user instruction after `SYSRET`, because `IA32_FMASK` clears the
+  trap flag on ring-0 entry. To step into the kernel handler, set a
+  breakpoint on `kernel::syscall::rust_syscall_dispatch` instead.
+
+Async Ctrl-C break, hardware breakpoints, and watchpoints are deferred to
+follow-on slices.
+
 ## Language roles
 
 | Language       | Use                                                  | Files |
@@ -152,6 +211,7 @@ some were superseded by later slices.
   slice 5 replaced the asm program with the C version.)*
 - **M3 slice 5 — C userspace + ELF loading** → `[user] hello from C userspace`
 - **M3 slice 6 — Benchmark + this README** → `[host] avg syscall latency: M ns`
+- **Slice 7 — GDB stub (post-PDF Tier C)** → `[host] gdb stub listening on 127.0.0.1:1234`
 
 ## Key lessons learned
 

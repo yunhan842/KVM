@@ -1,7 +1,7 @@
 //! Create the vCPU in 16-bit real mode and run it until HLT, dispatching exits.
 
 use anyhow::{bail, Context, Result};
-use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+use kvm_bindings::{kvm_debug_exit_arch, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::io::Write;
 
@@ -72,4 +72,64 @@ pub fn run<W: Write>(vcpu: &mut VcpuFd, uart: &mut Uart<W>, stats: &mut Stats) -
         }
     }
     Ok(())
+}
+
+/// Reason `run_until_event` returned control to the caller.
+pub enum StopReason {
+    /// SW BP (#BP, exception 3) or single-step (#DB, exception 1) trap.
+    Debug(kvm_debug_exit_arch),
+    /// Signal interruption (slice-8 path; unreachable in slice 7 but wired).
+    Intr,
+    /// Guest executed `hlt`.
+    Hlt,
+}
+
+/// Run the vCPU until the next Debug exit, Hlt, or signal-interrupt.
+/// Forwards IoIn/IoOut/Mmio internally exactly like `run()`. Unlike `run()`,
+/// it does NOT `?`-bail on EINTR — it returns `StopReason::Intr` (so the gdb
+/// stub can treat a Ctrl-C interrupt as a stop, in slice 8).
+pub fn run_until_event<W: Write>(
+    vcpu: &mut VcpuFd,
+    uart: &mut Uart<W>,
+    stats: &mut Stats,
+) -> Result<StopReason> {
+    loop {
+        match vcpu.run() {
+            Ok(VcpuExit::IoOut(port, data)) => {
+                stats.record_io();
+                if (COM1_BASE..=COM1_LAST).contains(&port) {
+                    for &b in data.iter() {
+                        uart.write_reg(port, b, stats);
+                    }
+                }
+            }
+            Ok(VcpuExit::IoIn(port, data)) => {
+                stats.record_io();
+                if (COM1_BASE..=COM1_LAST).contains(&port) {
+                    let v = uart.read_reg(port);
+                    for b in data.iter_mut() {
+                        *b = v;
+                    }
+                }
+            }
+            Ok(VcpuExit::MmioRead(_, _)) | Ok(VcpuExit::MmioWrite(_, _)) => {
+                stats.record_mmio();
+            }
+            Ok(VcpuExit::Hlt) => {
+                stats.record_hlt();
+                return Ok(StopReason::Hlt);
+            }
+            Ok(VcpuExit::Debug(arch)) => {
+                return Ok(StopReason::Debug(arch));
+            }
+            Ok(VcpuExit::Intr) => {
+                return Ok(StopReason::Intr);
+            }
+            Err(e) if e.errno() == libc::EINTR => {
+                return Ok(StopReason::Intr);
+            }
+            Err(e) => return Err(e).context("KVM_RUN failed"),
+            Ok(other) => bail!("unexpected VM exit: {other:?}"),
+        }
+    }
 }

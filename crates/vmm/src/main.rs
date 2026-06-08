@@ -1,4 +1,5 @@
 mod config;
+mod gdb;
 mod serial;
 mod stats;
 mod vcpu;
@@ -6,6 +7,9 @@ mod vm;
 
 use anyhow::{anyhow, Result};
 use std::io;
+
+use kvm_ioctls::VcpuFd;
+use vm_memory::GuestMemoryMmap;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,12 +43,41 @@ fn main() -> Result<()> {
     let mut vcpu = vcpu::create_vcpu(&kvm, &vm_fd)?;
     log("[host] created vCPU 0");
 
+    if cfg.gdb {
+        let stdout = io::stdout();
+        let mut uart = serial::Uart::new(stdout.lock());
+        let mut stats = stats::Stats::new();
+        // serve returns true if the guest halted DURING the gdb session (W00),
+        // false if gdb detached (D/EOF) with the guest still mid-run.
+        let halted = gdb::serve(&mut vcpu, &mem, &mut uart, &mut stats, cfg.gdb_port)?;
+        if !halted {
+            // gdb detached mid-run; finish the guest the normal way.
+            vcpu::run(&mut vcpu, &mut uart, &mut stats)?;
+        }
+        if cfg.trace {
+            println!("{}", stats.summary());
+            if let Some(ns) = stats.avg_syscall_ns() {
+                println!("[host] avg syscall latency: {ns} ns");
+            } else {
+                eprintln!("[host] benchmark incomplete (markers missing)");
+            }
+            // Runtime is "not measured" under --gdb: gdb pauses skew the timer.
+            println!("[host] runtime: not measured under --gdb");
+        }
+        Ok(())
+    } else {
+        run_non_gdb_path(&mut vcpu, &mem, &cfg)
+    }
+}
+
+/// The slice-1–6 main body. Owns the vCPU loop + stats summary lines.
+fn run_non_gdb_path(vcpu: &mut VcpuFd, _mem: &GuestMemoryMmap, cfg: &config::Config) -> Result<()> {
     let stdout = io::stdout();
     let mut uart = serial::Uart::new(stdout.lock());
     let mut stats = stats::Stats::new();
 
     let start = std::time::Instant::now();
-    vcpu::run(&mut vcpu, &mut uart, &mut stats)?;
+    vcpu::run(vcpu, &mut uart, &mut stats)?;
     let elapsed = start.elapsed();
 
     if cfg.trace {
