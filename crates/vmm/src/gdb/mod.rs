@@ -31,9 +31,7 @@ use packets::{DispatchAction, dispatch_stateless};
 pub struct Stub<'a, S: Read + Write, W: Write> {
     pub(crate) vcpu: &'a mut VcpuFd,
     pub(crate) mem: &'a GuestMemoryMmap,
-    #[allow(dead_code)]
     pub(crate) uart: &'a mut Uart<W>,
-    #[allow(dead_code)]
     pub(crate) stats: &'a mut Stats,
     pub(crate) stream: S,
     pub(crate) breakpoints: HashMap<u64, u8>,
@@ -62,8 +60,12 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
     }
 
     /// Run the Stopped↔Running loop until D / EOF / Hlt / k.
-    /// In Task 4, only the Stopped state is implemented; Running comes in Task 7.
-    pub fn run_session(&mut self) -> Result<(), StubError> {
+    ///
+    /// Returns `Ok(true)` if the guest halted (W00) *during* this session, or
+    /// `Ok(false)` on a clean detach (D) / EOF with the guest still mid-run.
+    /// The caller (main) uses this to decide whether to resume the guest after
+    /// `serve` returns.
+    pub fn run_session(&mut self) -> Result<bool, StubError> {
         loop {
             let pkt = match rsp::read_packet(&mut self.stream, self.noack_mode) {
                 Ok(p) => p,
@@ -71,7 +73,7 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
                 // stream is unusable; detach cleanly rather than crash the VMM.
                 Err(StubError::SocketDied) | Err(StubError::ProtocolViolation) => {
                     self.cleanup()?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(e) => return Err(e), // only Fatal (KVM ioctl) reaches here
             };
@@ -82,14 +84,38 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
                     rsp::write_packet(&mut self.stream, &payload, self.noack_mode)?;
                 }
                 DispatchAction::AlreadyReplied => continue,
-                DispatchAction::Resume { singlestep: _ } => {
-                    // Task 7 fills this in. For now, treat as protocol violation
-                    // to keep tests focused on Stopped-state behavior.
-                    return Err(StubError::ProtocolViolation);
+                DispatchAction::Resume { singlestep } => {
+                    use kvm_bindings::{
+                        KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_SW_BP,
+                    };
+                    // Re-arm KVM_SET_GUEST_DEBUG on EVERY resume: SINGLESTEP is
+                    // a one-shot control bit that does NOT latch across runs.
+                    let mut dbg = kvm_bindings::kvm_guest_debug::default();
+                    dbg.control = KVM_GUESTDBG_ENABLE
+                        | KVM_GUESTDBG_USE_SW_BP
+                        | if singlestep { KVM_GUESTDBG_SINGLESTEP } else { 0 };
+                    self.vcpu.set_guest_debug(&dbg)?; // Fatal-by-design
+
+                    match crate::vcpu::run_until_event(self.vcpu, self.uart, self.stats)
+                        .map_err(StubError::Fatal)?
+                    {
+                        crate::vcpu::StopReason::Debug(arch) => {
+                            let payload = stop_reply_for_debug(self.vcpu, arch)?;
+                            rsp::write_packet(&mut self.stream, payload, self.noack_mode)?;
+                        }
+                        crate::vcpu::StopReason::Intr => {
+                            rsp::write_packet(&mut self.stream, "T02thread:1;", self.noack_mode)?;
+                        }
+                        crate::vcpu::StopReason::Hlt => {
+                            self.cleanup()?;
+                            rsp::write_packet(&mut self.stream, "W00", self.noack_mode)?;
+                            return Ok(true);
+                        }
+                    }
                 }
                 DispatchAction::Detach => {
                     self.cleanup()?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 DispatchAction::Kill => {
                     self.cleanup()?;
@@ -208,9 +234,76 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
             };
             return Ok(DispatchAction::Reply(regs::target_xml_chunk(off, len).into()));
         }
-        // Stateful handlers (g, G, m, M, Z0, z0, c, s) come in Tasks 5/6/7.
-        // For now, fall through to dispatch_stateless and reply empty for
-        // anything else.
+        if pkt.starts_with(b"Z0,") {
+            // Z0,addr,kind — set a software breakpoint. Parse failures reply
+            // E22; out-of-bounds replies E14; never bubble ProtocolViolation.
+            let Ok(tail) = std::str::from_utf8(&pkt[3..]) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let Some((addr_s, _kind)) = tail.split_once(',') else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let Ok(addr) = u64::from_str_radix(addr_s, 16) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            if !bounded(addr, 1) {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E14")));
+            }
+            // Idempotent: re-Z0 on an existing address must not overwrite the
+            // saved original byte with the already-planted 0xCC.
+            if !self.breakpoints.contains_key(&addr) {
+                let saved = breakpoints::place(self.mem, addr)?; // Fatal-by-design (bounds-checked)
+                self.breakpoints.insert(addr, saved);
+            }
+            return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("OK")));
+        }
+        if pkt.starts_with(b"z0,") {
+            // z0,addr,kind — clear a software breakpoint.
+            let Ok(tail) = std::str::from_utf8(&pkt[3..]) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let Some((addr_s, _kind)) = tail.split_once(',') else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let Ok(addr) = u64::from_str_radix(addr_s, 16) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            if let Some(byte) = self.breakpoints.remove(&addr) {
+                breakpoints::restore(self.mem, addr, byte)?; // Fatal-by-design
+            }
+            return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("OK")));
+        }
+        if pkt.starts_with(b"c") && (pkt.len() == 1 || pkt[1..].iter().all(|b| b.is_ascii_hexdigit())) {
+            // c[addr] — continue, optionally from a new RIP. An overflowing
+            // hex addr replies E22 (parse_optional_resume_addr's Err half).
+            match packets::parse_optional_resume_addr(pkt) {
+                Ok(Some(addr)) => {
+                    let mut regs = self.vcpu.get_regs()?;
+                    regs.rip = addr;
+                    self.vcpu.set_regs(&regs)?;
+                }
+                Ok(None) => {}
+                Err(_) => return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22"))),
+            }
+            self.singlestep = false;
+            return Ok(DispatchAction::Resume { singlestep: false });
+        }
+        if pkt.starts_with(b"s") && (pkt.len() == 1 || pkt[1..].iter().all(|b| b.is_ascii_hexdigit())) {
+            // s[addr] — single-step, optionally from a new RIP.
+            match packets::parse_optional_resume_addr(pkt) {
+                Ok(Some(addr)) => {
+                    let mut regs = self.vcpu.get_regs()?;
+                    regs.rip = addr;
+                    self.vcpu.set_regs(&regs)?;
+                }
+                Ok(None) => {}
+                Err(_) => return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22"))),
+            }
+            self.singlestep = true;
+            return Ok(DispatchAction::Resume { singlestep: true });
+        }
+        // Remaining packets (?, q*, Q*, H*, v*, p, P, Z1-4, z1-4, k, D) are
+        // handled statelessly. Anything else replies empty ($#00).
         if let Some(a) = dispatch_stateless(pkt) {
             return Ok(a);
         }
@@ -228,7 +321,17 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
     }
 
     fn cleanup(&mut self) -> Result<(), StubError> {
-        // Task 7 implements memory restoration + KVM_SET_GUEST_DEBUG clear.
+        use vm_memory::{Bytes, GuestAddress};
+        // Restore every 0xCC byte we planted so the guest runs unmodified after
+        // detach. `self.mem` and `self.breakpoints` are disjoint fields, so the
+        // shared borrow of each coexists.
+        for (&addr, &orig) in &self.breakpoints {
+            self.mem.write_slice(&[orig], GuestAddress(addr))?;
+        }
+        self.breakpoints.clear();
+        // Tell KVM to stop intercepting int3 (control=0 disables guest debug).
+        let dbg = kvm_bindings::kvm_guest_debug::default();
+        self.vcpu.set_guest_debug(&dbg)?;
         Ok(())
     }
 }
@@ -246,6 +349,42 @@ pub(crate) fn bounded(addr: u64, len: usize) -> bool {
 /// overflow-safe. A `len` so large that 2*len wraps returns false.
 pub(crate) fn hex_len_matches(len: usize, payload_hex_len: usize) -> bool {
     len.checked_mul(2) == Some(payload_hex_len)
+}
+
+/// Map a Debug exit's exception number to (stop-reply payload, RIP decrement).
+///
+/// exception 3 = INT3 software breakpoint, exception 1 = single-step #DB.
+///
+/// RIP-decrement note (verified empirically against this kernel's KVM, NOT as
+/// the design spec §9.3 predicted): with `KVM_GUESTDBG_USE_SW_BP`, KVM already
+/// rewinds RIP to the address OF the `0xCC` before the `KVM_EXIT_DEBUG` — both
+/// `kvm_regs.rip` and `kvm_debug_exit_arch.pc` equal the breakpoint address,
+/// NOT one past it. So we must NOT decrement, or gdb sees `bp_addr - 1`, never
+/// matches its breakpoint, and spins re-continuing into the same `0xCC`.
+/// (The spec's "decrement by 1" holds only for a *raw* int3 where the handler
+/// reads RIP post-trap; the USE_SW_BP path does the rewind for us.)
+/// Single-step #DB (exception 1) leaves RIP at the next instruction — no fixup.
+/// Hence the decrement is 0 for every exception.
+pub(crate) fn classify_debug(exception: u32) -> (&'static str, u64) {
+    if exception == 3 {
+        ("T05swbreak:;thread:1;", 0)
+    } else {
+        ("T05thread:1;", 0)
+    }
+}
+
+/// Apply the RIP-1 fixup (if needed) and return the stop-reply payload.
+pub(crate) fn stop_reply_for_debug(
+    vcpu: &mut VcpuFd,
+    arch: kvm_bindings::kvm_debug_exit_arch,
+) -> Result<&'static str, StubError> {
+    let (reply, decrement) = classify_debug(arch.exception);
+    if decrement > 0 {
+        let mut regs = vcpu.get_regs()?;
+        regs.rip = regs.rip.wrapping_sub(decrement);
+        vcpu.set_regs(&regs)?;
+    }
+    Ok(reply)
 }
 
 /// Perform the QStartNoAckMode cutover on a raw stream. Returns Ok(()) only
@@ -266,7 +405,7 @@ pub fn serve<W: Write>(
     uart: &mut Uart<W>,
     stats: &mut Stats,
     port: u16,
-) -> Result<()> {
+) -> Result<bool> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let bound = listener.local_addr()?;
     // stderr so the integration test can capture the line independently of stdout.
@@ -278,6 +417,8 @@ pub fn serve<W: Write>(
     eprintln!("[host] gdb client connected");
     let _ = stream.set_read_timeout(None);
 
+    // run_session returns Ok(halted: bool); convert only the error half to
+    // anyhow, preserving the bool so `serve` is Result<bool, anyhow::Error>.
     let mut stub = Stub::new(vcpu, mem, uart, stats, stream);
     stub.run_session().map_err(|e| match e {
         StubError::Fatal(a) => a,
@@ -397,6 +538,30 @@ mod tests {
         // 0x8000000000000000 * 2 overflows usize → must be false, not a panic.
         assert!(!hex_len_matches(0x8000_0000_0000_0000, 0));
         assert!(!hex_len_matches(usize::MAX, 0));
+    }
+
+    #[test]
+    fn classify_debug_swbp_no_decrement() {
+        // KVM_GUESTDBG_USE_SW_BP already rewinds RIP to the int3 address before
+        // the KVM_EXIT_DEBUG (verified live: pc==rip==bp_addr), so the stub must
+        // NOT decrement — doing so makes gdb spin re-hitting the same 0xCC.
+        let (reply, dec) = classify_debug(3);
+        assert_eq!(reply, "T05swbreak:;thread:1;");
+        assert_eq!(dec, 0);
+    }
+
+    #[test]
+    fn classify_debug_single_step_no_decrement() {
+        let (reply, dec) = classify_debug(1);
+        assert_eq!(reply, "T05thread:1;");
+        assert_eq!(dec, 0);
+    }
+
+    #[test]
+    fn classify_debug_other_exception_no_decrement() {
+        let (reply, dec) = classify_debug(0);
+        assert_eq!(reply, "T05thread:1;");
+        assert_eq!(dec, 0);
     }
 
     #[test]
