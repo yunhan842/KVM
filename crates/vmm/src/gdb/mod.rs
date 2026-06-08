@@ -122,6 +122,66 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
             self.vcpu.set_regs(&regs)?;
             return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("OK")));
         }
+        if pkt.starts_with(b"m") {
+            // m<addr>,<len> — addr and len are hex.
+            let Ok(tail) = std::str::from_utf8(&pkt[1..]) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let Some((addr_s, len_s)) = tail.split_once(',') else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let (Ok(addr), Ok(len)) = (
+                u64::from_str_radix(addr_s, 16),
+                usize::from_str_radix(len_s, 16),
+            ) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            if !bounded(addr, len) {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E14")));
+            }
+            let mut buf = vec![0u8; len];
+            use vm_memory::{Bytes, GuestAddress};
+            self.mem.read_slice(&mut buf, GuestAddress(addr))?; // Fatal-by-design if it fails
+            let mut hex = String::with_capacity(2 * len);
+            for b in &buf {
+                hex.push_str(&format!("{:02x}", b));
+            }
+            return Ok(DispatchAction::Reply(hex.into()));
+        }
+        if pkt.starts_with(b"M") {
+            // M<addr>,<len>:<hex>
+            let Ok(tail) = std::str::from_utf8(&pkt[1..]) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let Some((head, payload)) = tail.split_once(':') else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let Some((addr_s, len_s)) = head.split_once(',') else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            let (Ok(addr), Ok(len)) = (
+                u64::from_str_radix(addr_s, 16),
+                usize::from_str_radix(len_s, 16),
+            ) else {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            };
+            if payload.len() != 2 * len {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+            }
+            if !bounded(addr, len) {
+                return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E14")));
+            }
+            let mut buf = Vec::with_capacity(len);
+            for i in 0..len {
+                let Ok(byte) = u8::from_str_radix(&payload[i * 2..i * 2 + 2], 16) else {
+                    return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("E22")));
+                };
+                buf.push(byte);
+            }
+            use vm_memory::{Bytes, GuestAddress};
+            self.mem.write_slice(&buf, GuestAddress(addr))?; // Fatal-by-design if it fails
+            return Ok(DispatchAction::Reply(std::borrow::Cow::Borrowed("OK")));
+        }
         if pkt.starts_with(b"qXfer:features:read:target.xml:") {
             // ".:<off>,<len>" — offset and length are hex per RSP. A malformed
             // qXfer must NOT crash the stub: reply empty (gdb's "unsupported"
@@ -163,6 +223,15 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
     fn cleanup(&mut self) -> Result<(), StubError> {
         // Task 7 implements memory restoration + KVM_SET_GUEST_DEBUG clear.
         Ok(())
+    }
+}
+
+/// True iff [addr .. addr+len) fits inside the guest physical address space.
+/// Overflow-safe: a wrapping addr+len returns false (rejected).
+pub(crate) fn bounded(addr: u64, len: usize) -> bool {
+    match addr.checked_add(len as u64) {
+        Some(end) => end <= crate::vm::MEM_SIZE as u64,
+        None => false,
     }
 }
 
@@ -283,5 +352,36 @@ mod tests {
         let mut b = BiCursor::new(b"");
         let result = qstart_noack_cutover(&mut b);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn bounds_inside_ok() {
+        assert!(bounded(0x0, 8));
+        assert!(bounded(0x1000, 0x1000));
+        assert!(bounded((crate::vm::MEM_SIZE - 8) as u64, 8));
+    }
+
+    #[test]
+    fn bounds_past_end_rejected() {
+        assert!(!bounded(crate::vm::MEM_SIZE as u64, 1));
+        assert!(!bounded((crate::vm::MEM_SIZE - 4) as u64, 8));
+    }
+
+    #[test]
+    fn bounds_overflow_rejected() {
+        assert!(!bounded(u64::MAX - 4, 8));
+        assert!(!bounded(u64::MAX, 1));
+    }
+
+    #[test]
+    fn vm_memory_roundtrip_via_read_write_slice() {
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+        let mem: GuestMemoryMmap<()> = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), crate::vm::MEM_SIZE)
+        ]).unwrap();
+        mem.write_slice(&[0xCC], GuestAddress(0x800000)).unwrap();
+        let mut buf = [0u8; 1];
+        mem.read_slice(&mut buf, GuestAddress(0x800000)).unwrap();
+        assert_eq!(buf[0], 0xCC);
     }
 }
