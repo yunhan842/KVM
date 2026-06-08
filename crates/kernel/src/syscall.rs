@@ -97,6 +97,7 @@ pub unsafe fn init() {
 /// frame lives at a fixed offset above RSP. The frame's bytes are valid (we
 /// pushed them moments before) and unaliased (single vCPU, non-reentrant), so
 /// the `unsafe { &*f }` inside is sound.
+#[inline(never)]
 #[no_mangle]
 pub unsafe extern "C" fn rust_syscall_dispatch(f: *const SyscallFrame) -> u64 {
     let f = &*f;

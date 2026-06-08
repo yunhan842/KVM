@@ -31,6 +31,6 @@ SECTIONS {
     .bss    : { *(.bss*) *(COMMON) } :data
 
     /DISCARD/ : {
-        *(.eh_frame*) *(.note*) *(.comment) *(.gnu*) *(.debug*)
+        *(.eh_frame*) *(.note*) *(.comment) *(.gnu*)
     }
 }

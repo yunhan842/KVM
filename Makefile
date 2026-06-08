@@ -6,7 +6,7 @@ KERNEL_ELF := target/x86_64-unknown-none/debug/kernel
 CC := gcc
 USER_CFLAGS  := -ffreestanding -nostdlib -fno-pic -fno-pie -mno-red-zone \
                 -fno-stack-protector -fno-stack-clash-protection \
-                -fcf-protection=none -O1
+                -fcf-protection=none -O1 -ggdb3
 USER_LDFLAGS := -nostartfiles -static -T user/link.ld \
                 -Wl,-z,max-page-size=0x1000 \
                 -Wl,-z,noexecstack \
@@ -38,3 +38,13 @@ guest.img: build/boot.bin kernel
 
 clean:
 	rm -rf build guest.img
+
+.PHONY: sanity
+sanity: build/hello.elf $(KERNEL_ELF)
+	@echo "[sanity] checking hello.elf has DWARF..."
+	@readelf -S build/hello.elf | grep -q '\.debug_info' \
+	    || (echo "FAIL: build/hello.elf has no .debug_info" && exit 1)
+	@echo "[sanity] checking kernel entry == 0x2000..."
+	@readelf -h $(KERNEL_ELF) | grep -q 'Entry point address:.*0x2000' \
+	    || (echo "FAIL: kernel entry != 0x2000" && exit 1)
+	@echo "[sanity] OK"
