@@ -1,5 +1,6 @@
 mod config;
 mod gdb;
+mod mmio;
 mod serial;
 mod stats;
 mod vcpu;
