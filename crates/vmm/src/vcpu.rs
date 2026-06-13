@@ -5,6 +5,7 @@ use kvm_bindings::{kvm_debug_exit_arch, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use std::io::Write;
 
+use crate::mmio::{MmioAction, MmioDevice};
 use crate::serial::{Uart, COM1_BASE, COM1_LAST};
 use crate::stats::Stats;
 use crate::vm::GUEST_LOAD_ADDR;
@@ -41,7 +42,12 @@ pub fn create_vcpu(kvm: &Kvm, vm_fd: &VmFd) -> Result<VcpuFd> {
 }
 
 /// Run the vCPU until HLT, forwarding serial output and counting exits.
-pub fn run<W: Write>(vcpu: &mut VcpuFd, uart: &mut Uart<W>, stats: &mut Stats) -> Result<()> {
+pub fn run<W: Write>(
+    vcpu: &mut VcpuFd,
+    uart: &mut Uart<W>,
+    stats: &mut Stats,
+    dev: &mut MmioDevice,
+) -> Result<()> {
     loop {
         match vcpu.run().context("KVM_RUN failed")? {
             VcpuExit::IoOut(port, data) => {
@@ -61,8 +67,19 @@ pub fn run<W: Write>(vcpu: &mut VcpuFd, uart: &mut Uart<W>, stats: &mut Stats) -
                     }
                 }
             }
-            VcpuExit::MmioRead(_, _) | VcpuExit::MmioWrite(_, _) => {
+            VcpuExit::MmioRead(addr, data) => {
                 stats.record_mmio();
+                if MmioDevice::claims(addr) {
+                    dev.read(addr, data);
+                }
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                stats.record_mmio();
+                if MmioDevice::claims(addr) {
+                    if let MmioAction::PowerOff = dev.write(addr, data) {
+                        break; // clean termination, exactly like Hlt
+                    }
+                }
             }
             VcpuExit::Hlt => {
                 stats.record_hlt();
@@ -82,6 +99,8 @@ pub enum StopReason {
     Intr,
     /// Guest executed `hlt`.
     Hlt,
+    /// Guest wrote the MMIO poweroff register — terminal, like Hlt.
+    PowerOff,
 }
 
 /// Run the vCPU until the next Debug exit, Hlt, or signal-interrupt.
@@ -92,6 +111,7 @@ pub fn run_until_event<W: Write>(
     vcpu: &mut VcpuFd,
     uart: &mut Uart<W>,
     stats: &mut Stats,
+    dev: &mut MmioDevice,
 ) -> Result<StopReason> {
     loop {
         match vcpu.run() {
@@ -112,8 +132,19 @@ pub fn run_until_event<W: Write>(
                     }
                 }
             }
-            Ok(VcpuExit::MmioRead(_, _)) | Ok(VcpuExit::MmioWrite(_, _)) => {
+            Ok(VcpuExit::MmioRead(addr, data)) => {
                 stats.record_mmio();
+                if MmioDevice::claims(addr) {
+                    dev.read(addr, data);
+                }
+            }
+            Ok(VcpuExit::MmioWrite(addr, data)) => {
+                stats.record_mmio();
+                if MmioDevice::claims(addr) {
+                    if let MmioAction::PowerOff = dev.write(addr, data) {
+                        return Ok(StopReason::PowerOff);
+                    }
+                }
             }
             Ok(VcpuExit::Hlt) => {
                 stats.record_hlt();

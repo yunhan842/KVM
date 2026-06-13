@@ -14,8 +14,10 @@ static mut PD: PageTable = PageTable([0; 512]);
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
+const PCD: u64 = 1 << 4; // page cache-disable (uncacheable) — required for MMIO
 const HUGE: u64 = 1 << 7;
 const PAGE_2MIB: u64 = 0x20_0000;
+const MMIO_PD_INDEX: usize = 32; // PD[32] covers 0x0400_0000..0x0420_0000
 
 /// Build a 64 MiB identity map and load it into CR3.
 ///
@@ -68,6 +70,30 @@ pub unsafe fn map_user_pd_entry(index: usize) {
     // CR3 reload: flush stale (supervisor-only) TLB entries for the touched walk
     // levels. The user-region leaf had no prior TLB entry, but PML4[0]/PDPT[0]
     // were cached as supervisor when kernel pages were accessed.
+    core::arch::asm!(
+        "mov rax, cr3",
+        "mov cr3, rax",
+        out("rax") _,
+        options(nostack, preserves_flags),
+    );
+}
+
+/// Map the 2 MiB MMIO window (containing the emulated host device) as an
+/// uncacheable identity page at PD[32] (GPA 0x0400_0000). Call once after
+/// `init_identity_map`, before any device access.
+///
+/// Uncacheable (PCD) is mandatory: a device register's value changes outside
+/// the CPU's knowledge (the host uptime counter ticks every ns), so a cached
+/// read would return stale data, and writes could be coalesced/reordered.
+///
+/// # Safety
+/// Must be called once, interrupts off, after `init_identity_map`.
+pub unsafe fn map_mmio_page() {
+    let pd = addr_of_mut!(PD);
+    (*pd).0[MMIO_PD_INDEX] =
+        (MMIO_PD_INDEX as u64 * PAGE_2MIB) | PRESENT | WRITABLE | HUGE | PCD;
+
+    // CR3 reload to flush any stale TLB entry for this walk.
     core::arch::asm!(
         "mov rax, cr3",
         "mov cr3, rax",

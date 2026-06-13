@@ -60,13 +60,15 @@ cargo run -p vmm -- run guest.img --trace
 [guest] gdt+tss installed
 hello from the kernel (long mode)
 [guest] syscall enabled
+[guest] host uptime via MMIO: 7533574 ns
 [guest] loaded /bin/hello
 [guest] entering ring 3
 [user] hello from C userspace
 [guest] user exited (code 0)
-[host] VM exits: io=749, hlt=1, mmio=0
-[host] avg syscall latency: 63 ns
-[host] runtime: 13.916236ms
+[host] guest powered off via MMIO
+[host] VM exits: io=831, hlt=0, mmio=2
+[host] avg syscall latency: 60 ns
+[host] runtime: 13.655753ms
 ```
 
 `avg syscall latency` measures the full SYSCALL/SYSRETQ round-trip through
@@ -184,6 +186,24 @@ Notes:
 Async Ctrl-C break, hardware breakpoints, and watchpoints are deferred to
 follow-on slices.
 
+## MMIO device
+
+Alongside the PIO serial port, the VMM emulates a tiny **memory-mapped I/O**
+device at guest-physical `0x04000000` — the first address past the 64 MiB of
+RAM. Because no KVM memslot backs that address, any guest access traps as
+`KVM_EXIT_MMIO` and the VMM services it (`crates/vmm/src/mmio.rs`). Two
+registers:
+
+- **`0x00` (read)** — host uptime in nanoseconds since the VMM started.
+- **`0x08` (write)** — writing a magic value powers the VM off (the guest's
+  normal termination, replacing `hlt`).
+
+The guest maps the device with one uncacheable page-table entry
+(`paging::map_mmio_page`) — uncacheable because a device register changes
+outside the CPU's knowledge, so a cached read would see a frozen clock. This
+is the same unbacked-address → trap → emulate mechanism every real device
+(NIC, disk, interrupt controller) uses; the serial port is its PIO sibling.
+
 ## Language roles
 
 | Language       | Use                                                  | Files |
@@ -212,6 +232,7 @@ some were superseded by later slices.
 - **M3 slice 5 — C userspace + ELF loading** → `[user] hello from C userspace`
 - **M3 slice 6 — Benchmark + this README** → `[host] avg syscall latency: M ns`
 - **Slice 7 — GDB stub (post-PDF Tier C)** → `[host] gdb stub listening on 127.0.0.1:1234`
+- **Slice 8 — MMIO device emulation** → `[guest] host uptime via MMIO: N ns` + poweroff
 
 ## Key lessons learned
 

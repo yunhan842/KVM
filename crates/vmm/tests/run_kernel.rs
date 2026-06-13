@@ -35,12 +35,15 @@ fn kernel_boots_to_long_mode_and_prints() {
         "[guest] gdt+tss installed",
         "hello from the kernel",
         "[guest] syscall enabled",
+        "[guest] host uptime via MMIO:",               // NEW (slice 8) — prefix only; ns is variable
         "[guest] loaded /bin/hello",                   // NEW (slice 5)
         "[guest] entering ring 3",
         "[user] hello from C userspace",               // NEW (slice 5; was "hello from ring 3")
         "[guest] user exited (code 0)",
+        "[host] guest powered off via MMIO",           // NEW (slice 8)
         "[host] avg syscall latency:",                 // NEW (slice 6) — prefix only; M ns is hardware-variable
-        "hlt=1",
+        "hlt=0",                                        // slice 8: poweroff replaces hlt
+        "mmio=2",                                       // slice 8: uptime read + poweroff write
     ] {
         assert!(stdout.contains(needle), "missing '{needle}' in:\n{stdout}");
     }

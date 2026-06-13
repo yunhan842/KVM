@@ -8,6 +8,7 @@ mod gdt;
 mod heap;
 mod idt;
 mod io;
+mod mmio;
 mod paging;
 mod serial;
 mod syscall;
@@ -27,6 +28,7 @@ pub extern "C" fn _start() -> ! {
     let mut com = Serial;
     let _ = writeln!(com, "[guest] kernel entered");
     unsafe { paging::init_identity_map(); }
+    unsafe { paging::map_mmio_page(); }
     let _ = writeln!(com, "[guest] paging enabled");
     unsafe { idt::init(); }
     let _ = writeln!(com, "[guest] idt loaded");
@@ -48,6 +50,9 @@ pub extern "C" fn _start() -> ! {
 
     unsafe { syscall::init(); }
     let _ = writeln!(com, "[guest] syscall enabled");
+
+    let uptime = mmio::read_host_uptime_ns();
+    let _ = writeln!(com, "[guest] host uptime via MMIO: {} ns", uptime);
 
     let entry = unsafe { user::setup() };
     let _ = writeln!(com, "[guest] loaded /bin/hello");
