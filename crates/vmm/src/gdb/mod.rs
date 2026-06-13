@@ -33,6 +33,7 @@ pub struct Stub<'a, S: Read + Write, W: Write> {
     pub(crate) mem: &'a GuestMemoryMmap,
     pub(crate) uart: &'a mut Uart<W>,
     pub(crate) stats: &'a mut Stats,
+    pub(crate) dev: &'a mut crate::mmio::MmioDevice,
     pub(crate) stream: S,
     pub(crate) breakpoints: HashMap<u64, u8>,
     pub(crate) noack_mode: bool,
@@ -44,6 +45,7 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
         mem: &'a GuestMemoryMmap,
         uart: &'a mut Uart<W>,
         stats: &'a mut Stats,
+        dev: &'a mut crate::mmio::MmioDevice,
         stream: S,
     ) -> Self {
         Self {
@@ -51,6 +53,7 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
             mem,
             uart,
             stats,
+            dev,
             stream,
             breakpoints: HashMap::new(),
             noack_mode: false,
@@ -96,7 +99,7 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
                     };
                     self.vcpu.set_guest_debug(&dbg)?; // Fatal-by-design
 
-                    match crate::vcpu::run_until_event(self.vcpu, self.uart, self.stats)
+                    match crate::vcpu::run_until_event(self.vcpu, self.uart, self.stats, self.dev)
                         .map_err(StubError::Fatal)?
                     {
                         crate::vcpu::StopReason::Debug(arch) => {
@@ -106,7 +109,7 @@ impl<'a, S: Read + Write, W: Write> Stub<'a, S, W> {
                         crate::vcpu::StopReason::Intr => {
                             rsp::write_packet(&mut self.stream, "T02thread:1;", self.noack_mode)?;
                         }
-                        crate::vcpu::StopReason::Hlt => {
+                        crate::vcpu::StopReason::Hlt | crate::vcpu::StopReason::PowerOff => {
                             self.cleanup()?;
                             rsp::write_packet(&mut self.stream, "W00", self.noack_mode)?;
                             return Ok(true);
@@ -404,6 +407,7 @@ pub fn serve<W: Write>(
     mem: &GuestMemoryMmap,
     uart: &mut Uart<W>,
     stats: &mut Stats,
+    dev: &mut crate::mmio::MmioDevice,
     port: u16,
 ) -> Result<bool> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
@@ -419,7 +423,7 @@ pub fn serve<W: Write>(
 
     // run_session returns Ok(halted: bool); convert only the error half to
     // anyhow, preserving the bool so `serve` is Result<bool, anyhow::Error>.
-    let mut stub = Stub::new(vcpu, mem, uart, stats, stream);
+    let mut stub = Stub::new(vcpu, mem, uart, stats, dev, stream);
     stub.run_session().map_err(|e| match e {
         StubError::Fatal(a) => a,
         other => anyhow::anyhow!("unexpected StubError leak: {other:?}"),

@@ -44,18 +44,23 @@ fn main() -> Result<()> {
     let mut vcpu = vcpu::create_vcpu(&kvm, &vm_fd)?;
     log("[host] created vCPU 0");
 
+    let mut mmio = mmio::MmioDevice::new();
+
     if cfg.gdb {
         let stdout = io::stdout();
         let mut uart = serial::Uart::new(stdout.lock());
         let mut stats = stats::Stats::new();
         // serve returns true if the guest halted DURING the gdb session (W00),
         // false if gdb detached (D/EOF) with the guest still mid-run.
-        let halted = gdb::serve(&mut vcpu, &mem, &mut uart, &mut stats, cfg.gdb_port)?;
+        let halted = gdb::serve(&mut vcpu, &mem, &mut uart, &mut stats, &mut mmio, cfg.gdb_port)?;
         if !halted {
             // gdb detached mid-run; finish the guest the normal way.
-            vcpu::run(&mut vcpu, &mut uart, &mut stats)?;
+            vcpu::run(&mut vcpu, &mut uart, &mut stats, &mut mmio)?;
         }
         if cfg.trace {
+            if mmio.powered_off() {
+                println!("[host] guest powered off via MMIO");
+            }
             println!("{}", stats.summary());
             if let Some(ns) = stats.avg_syscall_ns() {
                 println!("[host] avg syscall latency: {ns} ns");
@@ -67,21 +72,29 @@ fn main() -> Result<()> {
         }
         Ok(())
     } else {
-        run_non_gdb_path(&mut vcpu, &mem, &cfg)
+        run_non_gdb_path(&mut vcpu, &mem, &cfg, &mut mmio)
     }
 }
 
 /// The slice-1–6 main body. Owns the vCPU loop + stats summary lines.
-fn run_non_gdb_path(vcpu: &mut VcpuFd, _mem: &GuestMemoryMmap, cfg: &config::Config) -> Result<()> {
+fn run_non_gdb_path(
+    vcpu: &mut VcpuFd,
+    _mem: &GuestMemoryMmap,
+    cfg: &config::Config,
+    dev: &mut mmio::MmioDevice,
+) -> Result<()> {
     let stdout = io::stdout();
     let mut uart = serial::Uart::new(stdout.lock());
     let mut stats = stats::Stats::new();
 
     let start = std::time::Instant::now();
-    vcpu::run(vcpu, &mut uart, &mut stats)?;
+    vcpu::run(vcpu, &mut uart, &mut stats, dev)?;
     let elapsed = start.elapsed();
 
     if cfg.trace {
+        if dev.powered_off() {
+            println!("[host] guest powered off via MMIO");
+        }
         println!("{}", stats.summary());
         // Slice-6 benchmark line. eprintln on the failure path is intentional —
         // the absence of the prefix on stdout is what causes the integration
