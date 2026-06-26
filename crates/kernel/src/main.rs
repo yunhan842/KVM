@@ -62,8 +62,18 @@ pub extern "C" fn _start() -> ! {
     let _ = writeln!(com, "[guest] loaded /bin/hello");
     let _ = writeln!(com, "[guest] entering ring 3");
 
-    // Enable IF right before ring 3 so the first timer tick preempts ring-3
-    // user code (clean boot output; interrupted RIPs are user addresses).
+    // Enable IF in kernel mode. The PIT has been ticking since init() a few
+    // serial writes ago (each writeln! is many COM1 VM-exits = well over one
+    // 1 ms PIT period), so an IRQ0 is already latched in the PIC. `sti` thus
+    // delivers it almost immediately — but the x86 sti interrupt-shadow lets
+    // one more instruction (enable()'s `ret`) retire first, so the handler's
+    // saved RIP is the *next* kernel instruction here (a ring-0 interrupt: no
+    // privilege change, no TSS.RSP0 switch). enter_ring3 then iretq's into the
+    // user benchmark with IF=0, so the 10 000-syscall latency loop runs
+    // uninterrupted — which is why exactly one tick fires, in kernel mode.
+    // (True ring-3 preemption is deferred to a slice with a long-running user
+    // workload; enabling IF in ring 3 here would inject printf'd IRQ handlers
+    // mid-benchmark and wreck the measurement.)
     unsafe { interrupts::enable(); }
 
     // Hand control to ring 3 at the ELF entry point. The C program does

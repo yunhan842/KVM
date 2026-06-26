@@ -76,8 +76,10 @@ hello from the kernel (long mode)
 ```
 
 The `timer tick 1 (interrupted rip=0x…)` line is the timer-interrupt proof:
-the PIT's IRQ0 fired while ring-3 user code was running, so the captured RIP
-is a user-space address. See **Timer interrupts** below.
+the PIT's IRQ0 was delivered asynchronously and the handler captured the RIP
+it interrupted. That RIP is a *kernel* address (the instruction right after
+`sti`) — see **Timer interrupts** below for why the tick lands in kernel mode
+rather than in ring 3.
 
 `avg syscall latency` measures the full SYSCALL/SYSRETQ round-trip through
 the kernel's asm entry stub, the Rust dispatch table, and back to ring 3
@@ -248,11 +250,24 @@ blob (which ends in `hlt` with interrupts off) must run with `--no-irqchip`.
    ticks with the interrupted RIP, and sends the PIC end-of-interrupt (`out
    0x20, 0x20`) — without the EOI the PIC never delivers IRQ0 again.
 
-`sti` is deferred until just before `enter_ring3`, so the first tick lands
-while ring-3 user code is running: the CPU switches to the kernel stack via
-`TSS.RSP0`, runs the handler, and `iretq`s back to ring 3. The captured RIP
-being a user-space address is the end-to-end proof that the interrupt
-genuinely preempted the running program.
+**Where the tick lands (and why it's kernel mode).** By the time `sti` runs,
+the PIT has been ticking since `init()` — and the handful of `writeln!`s in
+between are many COM1 VM-exits each, far more than one 1 ms period — so an
+IRQ0 is already latched in the PIC. `sti` therefore delivers it right away,
+except the x86 **interrupt shadow** grants one more instruction (`enable()`'s
+`ret`) before interrupts are recognized. The handler's saved RIP is thus the
+*next kernel instruction*, a few bytes into `kernel_main` — a **ring-0**
+interrupt, so there is no privilege change and no `TSS.RSP0` stack switch.
+
+This is deliberate: `enter_ring3` hands off with `IF=0`, so the 10 000-syscall
+latency benchmark in ring 3 runs uninterrupted and the measurement stays
+clean. That's why exactly one tick fires, in kernel mode, at the same RIP
+every run. Enabling `IF` in ring 3 would give a textbook user-code preemption
+(with the `TSS.RSP0` switch), but the printing IRQ handler would land in the
+middle of the benchmark and wreck it — so true ring-3 preemption waits for a
+slice with a long-running user workload. What this slice proves end-to-end is
+asynchronous delivery: IDT gate 32 → `isr_common` save → handler → EOI →
+`iretq`-resume, with the interrupted RIP captured as evidence.
 
 ## Language roles
 
