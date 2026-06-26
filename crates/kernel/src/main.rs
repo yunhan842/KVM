@@ -55,9 +55,16 @@ pub extern "C" fn _start() -> ! {
     let uptime = mmio::read_host_uptime_ns();
     let _ = writeln!(com, "[guest] host uptime via MMIO: {} ns", uptime);
 
+    unsafe { interrupts::init(); }
+    let _ = writeln!(com, "[guest] interrupts: PIC remapped, PIT at 1000 Hz");
+
     let entry = unsafe { user::setup() };
     let _ = writeln!(com, "[guest] loaded /bin/hello");
     let _ = writeln!(com, "[guest] entering ring 3");
+
+    // Enable IF right before ring 3 so the first timer tick preempts ring-3
+    // user code (clean boot output; interrupted RIPs are user addresses).
+    unsafe { interrupts::enable(); }
 
     // Hand control to ring 3 at the ELF entry point. The C program does
     // write(1, "[user] hello from C userspace\n", 30) and exit(0); sys_exit
