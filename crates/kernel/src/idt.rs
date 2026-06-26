@@ -27,6 +27,10 @@ extern "C" {
     fn isr_20(); fn isr_21(); fn isr_22(); fn isr_23();
     fn isr_24(); fn isr_25(); fn isr_26(); fn isr_27();
     fn isr_28(); fn isr_29(); fn isr_30(); fn isr_31();
+    fn isr_32(); fn isr_33(); fn isr_34(); fn isr_35();
+    fn isr_36(); fn isr_37(); fn isr_38(); fn isr_39();
+    fn isr_40(); fn isr_41(); fn isr_42(); fn isr_43();
+    fn isr_44(); fn isr_45(); fn isr_46(); fn isr_47();
 }
 
 // 16-byte long-mode gate descriptor. Intel SDM Vol 3A Sec 6.14.1.
@@ -144,10 +148,14 @@ pub unsafe fn init() {
         isr_20, isr_21, isr_22, isr_23,
         isr_24, isr_25, isr_26, isr_27,
         isr_28, isr_29, isr_30, isr_31,
+        isr_32, isr_33, isr_34, isr_35,
+        isr_36, isr_37, isr_38, isr_39,
+        isr_40, isr_41, isr_42, isr_43,
+        isr_44, isr_45, isr_46, isr_47,
     ];
 
     let mut i = 0usize;
-    while i < 32 {
+    while i < 48 {
         let handler_addr = handlers[i] as usize as u64;
         let gate = if i == 3 {
             GateDescriptor::new_dpl3(handler_addr)
@@ -186,17 +194,27 @@ pub unsafe fn set_ist(vector: usize, ist: u8) {
 
 /// Common Rust entry from `isr_common`.
 ///
-/// Prints a one-line context dump over COM1 and halts. Doesn't try to recover:
-/// returning to faulting code is a scheduler/syscall concern this slice doesn't
-/// own. The host sees the resulting `hlt` as KVM_EXIT_HLT and the run loop
-/// terminates normally.
+/// Vector 32 (PIT IRQ0): handle the tick and RETURN, so `isr_common`'s epilogue
+/// restores the GPRs and `iretq`s back to the interrupted code with IF restored.
+/// Vectors 33..48: spurious/unexpected PIC IRQ (only IRQ0 is unmasked) — return
+/// without EOI. Vectors 0..32: CPU exception — dump a context line and halt
+/// (unchanged from slice 2; never returns, so the epilogue stays dead for it).
 #[no_mangle]
-pub extern "C" fn rust_isr_dispatch(ctx: &InterruptContext) -> ! {
+pub extern "C" fn rust_isr_dispatch(ctx: &InterruptContext) {
+    let vector = ctx.vector;
+
+    if vector == 32 {
+        crate::interrupts::handle_timer(ctx.rip);
+        return;
+    }
+    if (33..48).contains(&vector) {
+        return; // spurious PIC IRQ — do NOT EOI
+    }
+
+    // CPU exception (vectors 0..32): fatal one-line dump + halt.
     // Copy the fields we read into locals -- the InterruptContext is `repr(C)`
     // (not packed), so direct field access is well-aligned, but pulling values
-    // into locals keeps the writeln! call site tidy and avoids any temptation
-    // to take a reference to a struct field across the macro expansion.
-    let vector = ctx.vector;
+    // into locals keeps the writeln! call site tidy.
     let rip = ctx.rip;
     let rflags = ctx.rflags;
     let err = ctx.error_code;

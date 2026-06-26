@@ -7,6 +7,7 @@ mod elf;
 mod gdt;
 mod heap;
 mod idt;
+mod interrupts;
 mod io;
 mod mmio;
 mod paging;
