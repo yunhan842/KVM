@@ -18,8 +18,13 @@ fn boots_guest_and_prints_hello() {
         "missing {blob} — run `nasm -f bin guest/hello.asm -o guest/hello.bin`"
     );
 
+    // --no-irqchip: this throwaway blob ends with `hlt` and relies on
+    // KVM_EXIT_HLT reaching userspace (asserted below as hlt=1). The default
+    // in-kernel irqchip (added in the timer-interrupt slice) would instead make
+    // the LAPIC swallow the halt into a wait-for-interrupt and hang it, since
+    // the blob runs with IF=0 and no IDT.
     let output = Command::new(env!("CARGO_BIN_EXE_vmm"))
-        .args(["run", blob, "--trace"])
+        .args(["run", blob, "--trace", "--no-irqchip"])
         .output()
         .expect("failed to spawn vmm");
 
