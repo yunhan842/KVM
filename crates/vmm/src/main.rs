@@ -34,6 +34,15 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("KVM_SET_TSS_ADDR failed: {e}"))?;
     log("[host] created VM");
 
+    // In-kernel irqchip + PIT. Default on (the kernel guest wants timer IRQs);
+    // the Month-1 real-mode blob passes --no-irqchip because an in-kernel LAPIC
+    // turns `hlt` into an in-kernel wait-for-interrupt instead of a userspace
+    // exit, which would hang that IF=0, no-IDT blob. See config::Config::irqchip.
+    if cfg.irqchip {
+        vm::setup_irqchip(&vm_fd)?;
+        log("[host] in-kernel irqchip + PIT created");
+    }
+
     let mem = vm::setup_memory(&vm_fd)?;
     log(&format!(
         "[host] mapped {} MiB guest memory",

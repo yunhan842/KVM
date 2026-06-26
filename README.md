@@ -50,6 +50,7 @@ cargo run -p vmm -- run guest.img --trace
 
 ```
 [host] created VM
+[host] in-kernel irqchip + PIT created
 [host] mapped 64 MiB guest memory
 [host] created vCPU 0
 [guest] kernel entered
@@ -60,16 +61,25 @@ cargo run -p vmm -- run guest.img --trace
 [guest] gdt+tss installed
 hello from the kernel (long mode)
 [guest] syscall enabled
-[guest] host uptime via MMIO: 7533574 ns
+[guest] host uptime via MMIO: 4032405 ns
+[guest] interrupts: PIC remapped, PIT at 1000 Hz
 [guest] loaded /bin/hello
 [guest] entering ring 3
+[guest] timer tick 1 (interrupted rip=0x24df)
 [user] hello from C userspace
 [guest] user exited (code 0)
+[guest] handled 1 timer ticks
 [host] guest powered off via MMIO
-[host] VM exits: io=831, hlt=0, mmio=2
-[host] avg syscall latency: 60 ns
-[host] runtime: 13.655753ms
+[host] VM exits: io=1081, hlt=0, mmio=2
+[host] avg syscall latency: 62 ns
+[host] runtime: 11.163913ms
 ```
+
+The `timer tick 1 (interrupted rip=0x…)` line is the timer-interrupt proof:
+the PIT's IRQ0 was delivered asynchronously and the handler captured the RIP
+it interrupted. That RIP is a *kernel* address (the instruction right after
+`sti`) — see **Timer interrupts** below for why the tick lands in kernel mode
+rather than in ring 3.
 
 `avg syscall latency` measures the full SYSCALL/SYSRETQ round-trip through
 the kernel's asm entry stub, the Rust dispatch table, and back to ring 3
@@ -204,6 +214,61 @@ outside the CPU's knowledge, so a cached read would see a frozen clock. This
 is the same unbacked-address → trap → emulate mechanism every real device
 (NIC, disk, interrupt controller) uses; the serial port is its PIO sibling.
 
+## Timer interrupts
+
+Every exit so far is *guest-caused* — an IO/MMIO access or a syscall the guest
+chose to make. A timer interrupt is the first **asynchronous** event: the
+outside world preempting the guest mid-instruction. This is the mechanism a
+real OS uses to take the CPU back from a runaway program.
+
+**Host side.** One ioctl pair, `setup_irqchip` (`crates/vmm/src/vm.rs`):
+
+- `KVM_CREATE_IRQCHIP` puts the legacy interrupt controllers — 8259 PIC,
+  IOAPIC, and per-vCPU LAPIC — *inside* KVM.
+- `KVM_CREATE_PIT2` adds an in-kernel 8254 PIT.
+
+With both in-kernel, KVM injects IRQ0 on the right vCPU automatically; the
+`KVM_RUN` loop needs **no** change to deliver interrupts. The price is that an
+in-kernel LAPIC also changes `hlt`: a halted vCPU now waits in-kernel for an
+interrupt instead of exiting to userspace. That is why the Month-1 real-mode
+blob (which ends in `hlt` with interrupts off) must run with `--no-irqchip`.
+
+**Guest side** (`crates/kernel/src/interrupts.rs`):
+
+1. **Remap the PIC.** The 8259 defaults to vectors 0x08–0x0F, which collide
+   with the CPU's exception vectors. The ICW1–ICW4 init sequence moves IRQ0–7
+   to 0x20–0x27 (so the timer is vector 32), then OCW1 masks every line except
+   IRQ0.
+2. **Program the PIT.** Mode 2 (rate generator), divisor =
+   `1193182 / 1000` → a ~1 kHz tick. The divisor math is a pure function,
+   re-derived host-side in `crates/vmm/tests/pit_divisor.rs`.
+3. **IDT gate 32.** `idt_stubs.s` gained 16 IRQ trampolines (vectors 32–47)
+   that reuse the same `isr_common` save/restore path the exception stubs use;
+   its epilogue (`pop`s, `add rsp,16`, `iretq`) was already built to *return*,
+   which is exactly what an IRQ handler must do.
+4. **Handle + EOI.** `handle_timer` bumps an `AtomicU64`, prints the first few
+   ticks with the interrupted RIP, and sends the PIC end-of-interrupt (`out
+   0x20, 0x20`) — without the EOI the PIC never delivers IRQ0 again.
+
+**Where the tick lands (and why it's kernel mode).** By the time `sti` runs,
+the PIT has been ticking since `init()` — and the handful of `writeln!`s in
+between are many COM1 VM-exits each, far more than one 1 ms period — so an
+IRQ0 is already latched in the PIC. `sti` therefore delivers it right away,
+except the x86 **interrupt shadow** grants one more instruction (`enable()`'s
+`ret`) before interrupts are recognized. The handler's saved RIP is thus the
+*next kernel instruction*, a few bytes into `kernel_main` — a **ring-0**
+interrupt, so there is no privilege change and no `TSS.RSP0` stack switch.
+
+This is deliberate: `enter_ring3` hands off with `IF=0`, so the 10 000-syscall
+latency benchmark in ring 3 runs uninterrupted and the measurement stays
+clean. That's why exactly one tick fires, in kernel mode, at the same RIP
+every run. Enabling `IF` in ring 3 would give a textbook user-code preemption
+(with the `TSS.RSP0` switch), but the printing IRQ handler would land in the
+middle of the benchmark and wreck it — so true ring-3 preemption waits for a
+slice with a long-running user workload. What this slice proves end-to-end is
+asynchronous delivery: IDT gate 32 → `isr_common` save → handler → EOI →
+`iretq`-resume, with the interrupted RIP captured as evidence.
+
 ## Language roles
 
 | Language       | Use                                                  | Files |
@@ -233,6 +298,7 @@ some were superseded by later slices.
 - **M3 slice 6 — Benchmark + this README** → `[host] avg syscall latency: M ns`
 - **Slice 7 — GDB stub (post-PDF Tier C)** → `[host] gdb stub listening on 127.0.0.1:1234`
 - **Slice 8 — MMIO device emulation** → `[guest] host uptime via MMIO: N ns` + poweroff
+- **Slice 9 — Timer interrupts (in-kernel irqchip + PIT)** → `[guest] timer tick 1 (interrupted rip=0x…)`
 
 ## Key lessons learned
 
@@ -274,6 +340,14 @@ been invisible without slice 2's IDT or slice 4a's IST catching them:
   qwords (48 bytes = 3×16) so if the kernel stack top is 16-aligned, the
   Rust dispatcher's prologue sees the right alignment. The dedicated
   syscall stack is `#[repr(C, align(16))]` for this reason.
+- **An in-kernel LAPIC silently changes `hlt`.** `KVM_CREATE_IRQCHIP` was a
+  prerequisite for timer-interrupt delivery, but it also means a halted vCPU
+  blocks in-kernel waiting for an interrupt instead of returning
+  `KVM_EXIT_HLT`. The Month-1 real-mode blob ends in `hlt` with `IF=0` and no
+  IDT, so once the irqchip became the default it hung forever — surfaced as a
+  70-second test timeout. The fix was a `--no-irqchip` opt-out for that legacy
+  guest; the lesson is that one ioctl quietly rewires an instruction three
+  layers away.
 
 ## References
 

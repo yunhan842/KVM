@@ -1,7 +1,7 @@
 //! Open /dev/kvm, create the VM, map guest memory, and load the guest blob.
 
 use anyhow::{Context, Result};
-use kvm_bindings::kvm_userspace_memory_region;
+use kvm_bindings::{kvm_pit_config, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VmFd};
 // `get_host_address` lives on the `GuestMemoryBackend` trait as of vm-memory 0.18
 // (it used to be on `GuestMemory`); `Bytes` provides `write_slice`.
@@ -18,6 +18,21 @@ pub fn open_kvm() -> Result<Kvm> {
         "failed to open /dev/kvm — is it present (`ls -l /dev/kvm`) and are you in the 'kvm' group? \
          (sudo usermod -aG kvm $USER, then `wsl --shutdown` and reopen)",
     )
+}
+
+/// Create the in-kernel interrupt chip (PIC + IOAPIC + LAPIC) and the in-kernel
+/// 8254 PIT. MUST be called after `create_vm` and BEFORE `create_vcpu` — KVM
+/// creates the per-vCPU LAPIC at vCPU-creation time and requires the irqchip to
+/// exist first. With both in-kernel, the PIT's IRQ0 is delivered to the guest
+/// automatically on each KVM_RUN; the VMM never injects an interrupt itself.
+pub fn setup_irqchip(vm_fd: &VmFd) -> Result<()> {
+    vm_fd
+        .create_irq_chip()
+        .context("KVM_CREATE_IRQCHIP failed")?;
+    vm_fd
+        .create_pit2(kvm_pit_config::default())
+        .context("KVM_CREATE_PIT2 failed")?;
+    Ok(())
 }
 
 /// Allocate a 64 MiB host-backed region and register it with the VM at GPA 0.

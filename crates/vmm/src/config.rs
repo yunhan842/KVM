@@ -1,10 +1,17 @@
-//! Hand-rolled CLI parsing for `minikvm run <guest.bin> [--trace] [--gdb [--gdb-port N]]`.
+//! Hand-rolled CLI parsing for
+//! `minikvm run <guest.bin> [--trace] [--no-irqchip] [--gdb [--gdb-port N]]`.
 //! No clap yet (YAGNI) — one subcommand, one positional, a few flags.
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Config {
     pub guest_path: String,
     pub trace: bool,
+    /// Create the in-kernel irqchip (PIC+IOAPIC+LAPIC) and PIT. Default ON —
+    /// the Rust kernel guest wants timer interrupts. The Month-1 throwaway
+    /// real-mode blob must turn this OFF (`--no-irqchip`): with an in-kernel
+    /// LAPIC, `hlt` no longer exits to userspace — the vCPU blocks waiting for
+    /// an interrupt, and that blob runs IF=0 with no IDT, so it would hang.
+    pub irqchip: bool,
     pub gdb: bool,
     pub gdb_port: u16,
 }
@@ -17,13 +24,15 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
         Some(other) => return Err(format!("unknown command '{other}'; expected 'run'")),
         None => {
             return Err(
-                "usage: minikvm run <guest.bin> [--trace] [--gdb [--gdb-port N]]".to_string(),
+                "usage: minikvm run <guest.bin> [--trace] [--no-irqchip] [--gdb [--gdb-port N]]"
+                    .to_string(),
             );
         }
     }
 
     let mut guest_path: Option<String> = None;
     let mut trace = false;
+    let mut irqchip = true;
     let mut gdb = false;
     let mut gdb_port: u16 = 1234;
     let mut gdb_port_explicit = false;
@@ -31,6 +40,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--trace" => trace = true,
+            "--no-irqchip" => irqchip = false,
             "--gdb" => gdb = true,
             s if s.starts_with("--gdb-port=") => {
                 return Err(
@@ -61,7 +71,7 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
     }
 
     let guest_path = guest_path.ok_or("missing guest image path")?;
-    Ok(Config { guest_path, trace, gdb, gdb_port })
+    Ok(Config { guest_path, trace, irqchip, gdb, gdb_port })
 }
 
 #[cfg(test)]
@@ -80,6 +90,7 @@ mod tests {
             Config {
                 guest_path: "guest/hello.bin".to_string(),
                 trace: true,
+                irqchip: true,
                 gdb: false,
                 gdb_port: 1234,
             }
@@ -90,6 +101,18 @@ mod tests {
     fn trace_defaults_off() {
         let cfg = parse_args(&v(&["run", "g.bin"])).unwrap();
         assert!(!cfg.trace);
+    }
+
+    #[test]
+    fn irqchip_defaults_on() {
+        let cfg = parse_args(&v(&["run", "g.bin"])).unwrap();
+        assert!(cfg.irqchip);
+    }
+
+    #[test]
+    fn no_irqchip_flag_turns_it_off() {
+        let cfg = parse_args(&v(&["run", "guest/hello.bin", "--no-irqchip"])).unwrap();
+        assert!(!cfg.irqchip);
     }
 
     #[test]
