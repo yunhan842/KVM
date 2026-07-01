@@ -65,7 +65,7 @@ pub unsafe fn enter_ring3(entry: u64) -> ! {
         // the full 64-bit value.
         ss     = const ((gdt::USER_SS  | 3) as i32),
         rsp    = const (USER_STACK_TOP as i32),     // strictly inside PD[4]
-        rflags = const 0x2_i32,                     // IF=0, bit 1 reserved-set
+        rflags = const 0x202_i32,                   // IF=1 (bit 9) + reserved bit 1: ring 3 is preemptible
         cs     = const ((gdt::USER_CS64 | 3) as i32),
         entry  = in(reg) entry,
         options(noreturn),

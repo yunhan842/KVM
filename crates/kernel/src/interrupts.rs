@@ -1,9 +1,11 @@
 //! 8259 PIC + 8254 PIT timer-interrupt setup and the timer IRQ handler.
 //!
 //! KVM provides the in-kernel PIC/PIT (created VMM-side); here the guest
-//! programs them: remap the PIC so IRQ0 lands on a free vector, set the PIT
-//! frequency, then enable IF. The handler counts ticks, prints the first few
-//! with the interrupted RIP (proving asynchronous preemption), and EOIs.
+//! programs them: remap the PIC (IRQ0 → vector 0x20) with every line masked,
+//! set the PIT to 1 kHz, and expose `unmask_timer()`. Ring 3 runs with IF=1, so
+//! once the user program calls SYS_PREEMPT to unmask IRQ0, timer ticks preempt
+//! ring-3 code (ring3 → ring0 via TSS.RSP0). The handler counts ticks, prints
+//! the first few with the interrupted (user-space) RIP, and EOIs.
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -57,7 +59,7 @@ pub unsafe fn remap_pic() {
     outb(PIC2_DATA, 0x02); // ICW3: slave cascade identity 2
     outb(PIC1_DATA, 0x01); // ICW4: 8086/88 mode
     outb(PIC2_DATA, 0x01);
-    outb(PIC1_DATA, 0xFE); // OCW1: master mask — unmask only IRQ0
+    outb(PIC1_DATA, 0xFF); // OCW1: master mask — mask ALL lines (ring 3 unmasks IRQ0 via SYS_PREEMPT)
     outb(PIC2_DATA, 0xFF); // OCW1: slave mask — mask all
 }
 
@@ -93,18 +95,10 @@ pub unsafe fn init() {
     program_pit();
 }
 
-/// Enable interrupt delivery (`sti`). Call once, after `init()`, when ready to
-/// be preempted — here, right before entering ring 3.
-///
-/// # Safety
-/// Only call after the IDT gates for 0x20..0x2F and the PIC remap are in place.
-pub unsafe fn enable() {
-    core::arch::asm!("sti", options(nomem, nostack));
-}
-
 /// Timer IRQ handler body (called from `rust_isr_dispatch` for vector 0x20).
-/// `rip` is the interrupted instruction pointer (from the IRQ frame). Counts the
-/// tick, prints the first few with their RIP, and EOIs the master PIC.
+/// `rip` is the interrupted instruction pointer from the IRQ frame — a ring-3
+/// (user) address once SYS_PREEMPT has unmasked IRQ0. Counts the tick, prints
+/// the first few with their RIP, and EOIs the master PIC.
 pub fn handle_timer(rip: u64) {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= PRINT_FIRST_N {
