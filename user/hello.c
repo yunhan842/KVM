@@ -16,8 +16,10 @@
 
 extern long write(int fd, const char *buf, unsigned long len);
 extern void exit(int code) __attribute__((noreturn));
+extern void preempt(void);     /* SYS_PREEMPT: ask the kernel to start delivering timer ticks */
 
-#define BENCH_ITERS 10000UL
+#define BENCH_ITERS  10000UL
+#define PREEMPT_SPIN 25000000UL    /* busy-loop iterations; tuned for ~tens of ms (≈ tens of 1 kHz ticks) */
 
 /* Emit the 11-byte start marker:
  *   0x1B 0x42 0x30 + 8 little-endian bytes of `n`.
@@ -55,5 +57,15 @@ int main(void) {
 
     /* Existing slice-5 demo line — still the slice-5 load-bearing assertion. */
     write(1, "[user] hello from C userspace\n", 30);
+
+    /* Preemption demo: from here on, let the timer interrupt us. preempt()
+       unmasks the PIT IRQ; the busy-spin then runs long enough that several
+       1 kHz ticks land *in this ring-3 loop* — each switches ring3 -> ring0 via
+       TSS.RSP0, runs the handler, and iretq's back here. The benchmark above
+       ran with IRQ0 masked, so it stayed interrupt-free. `volatile` stops the
+       compiler from deleting the empty loop. */
+    preempt();
+    for (volatile unsigned long i = 0; i < PREEMPT_SPIN; i++) { }
+
     return 0;
 }

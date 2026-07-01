@@ -25,8 +25,9 @@ pub const IA32_FMASK: u32 = 0xC000_0084;
 // Syscall numbers. The asm ring-3 program in user.rs inlines the same literal
 // values (global_asm! can't consume Rust consts), so DON'T change these without
 // updating user.rs in lockstep.
-pub const SYS_WRITE: u64 = 1;
-pub const SYS_EXIT:  u64 = 2;
+pub const SYS_WRITE:   u64 = 1;
+pub const SYS_EXIT:    u64 = 2;
+pub const SYS_PREEMPT: u64 = 3;
 
 /// Saved syscall state pushed by `syscall_entry.s`. Layout MUST mirror the push
 /// order: num at the lowest address.
@@ -102,10 +103,20 @@ pub unsafe fn init() {
 pub unsafe extern "C" fn rust_syscall_dispatch(f: *const SyscallFrame) -> u64 {
     let f = &*f;
     match f.num {
-        SYS_WRITE => sys_write(f.arg1, f.arg2, f.arg3),
-        SYS_EXIT  => sys_exit(f.arg1),
-        _         => u64::MAX,
+        SYS_WRITE   => sys_write(f.arg1, f.arg2, f.arg3),
+        SYS_EXIT    => sys_exit(f.arg1),
+        SYS_PREEMPT => sys_preempt(),
+        _           => u64::MAX,
     }
+}
+
+/// Demo syscall: unmask the PIT IRQ so timer ticks start preempting ring-3
+/// code. Returns 0. A real kernel would never let ring 3 touch interrupt masks;
+/// this exists only to stage the preemption demo *after* the latency benchmark,
+/// so the benchmark itself runs tick-free.
+fn sys_preempt() -> u64 {
+    unsafe { crate::interrupts::unmask_timer(); }
+    0
 }
 
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
@@ -120,7 +131,13 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
 fn sys_exit(code: u64) -> ! {
     let mut com = Serial;
     let _ = writeln!(com, "[guest] user exited (code {})", code);
-    let _ = writeln!(com, "[guest] handled {} timer ticks", crate::interrupts::tick_count());
+    let ticks = crate::interrupts::tick_count();
+    let rips = crate::interrupts::first_rips();
+    let _ = writeln!(
+        com,
+        "[guest] handled {} timer ticks; first ring-3 RIPs preempted: {:#x} {:#x} {:#x}",
+        ticks, rips[0], rips[1], rips[2],
+    );
     // Ask the host to power off (replaces hlt as the normal termination).
     // The VMM stops on this MMIO write, so the loop below is a defensive
     // fallback that runs only if poweroff were ever disabled.

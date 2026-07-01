@@ -12,8 +12,8 @@
 # three args in RDI/RSI/RDX, which is EXACTLY what our SYSCALL ABI expects.
 # No register marshaling — just "set RAX, syscall, ret".
 #
-# Syscall numbers: 1 = write, 2 = exit. Must match crates/kernel/src/syscall.rs
-# (SYS_WRITE = 1, SYS_EXIT = 2).
+# Syscall numbers: 1 = write, 2 = exit, 3 = preempt. Must match
+# crates/kernel/src/syscall.rs (SYS_WRITE / SYS_EXIT / SYS_PREEMPT).
 
 .intel_syntax noprefix
 .section .text
@@ -36,6 +36,12 @@ exit:                         # exit(code): RDI already set
     mov rax, 2                # SYS_EXIT
     syscall                   # sys_exit halts the kernel; never returns
     ud2
+
+.globl preempt
+preempt:                      # preempt(): no args; asks the kernel to start
+    mov rax, 3                # SYS_PREEMPT  delivering timer interrupts to us
+    syscall                   # returns to caller; result (0) in RAX, ignored
+    ret
 
 # Declare non-executable stack. Without this section GNU ld 2.42 warns
 # "missing .note.GNU-stack section implies executable stack".

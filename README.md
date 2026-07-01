@@ -61,25 +61,27 @@ cargo run -p vmm -- run guest.img --trace
 [guest] gdt+tss installed
 hello from the kernel (long mode)
 [guest] syscall enabled
-[guest] host uptime via MMIO: 4032405 ns
-[guest] interrupts: PIC remapped, PIT at 1000 Hz
+[guest] host uptime via MMIO: 4409984 ns
+[guest] interrupts: PIC remapped (IRQ0 masked), PIT at 1000 Hz
 [guest] loaded /bin/hello
 [guest] entering ring 3
-[guest] timer tick 1 (interrupted rip=0x24df)
 [user] hello from C userspace
 [guest] user exited (code 0)
-[guest] handled 1 timer ticks
+[guest] handled 36 timer ticks; first ring-3 RIPs preempted: 0x80002c 0x8000e6 0x8000e6
 [host] guest powered off via MMIO
-[host] VM exits: io=1081, hlt=0, mmio=2
-[host] avg syscall latency: 62 ns
-[host] runtime: 11.163913ms
+[host] VM exits: io=1307, hlt=0, mmio=2
+[host] avg syscall latency: 63 ns
+[host] runtime: 49.059117ms
 ```
 
-The `timer tick 1 (interrupted rip=0x…)` line is the timer-interrupt proof:
-the PIT's IRQ0 was delivered asynchronously and the handler captured the RIP
-it interrupted. That RIP is a *kernel* address (the instruction right after
-`sti`) — see **Timer interrupts** below for why the tick lands in kernel mode
-rather than in ring 3.
+The `RIPs preempted` line is the timer-interrupt proof: those are **ring-3
+user addresses** the PIT's IRQ0 interrupted. `0x80002c` is the `ret` of the
+`preempt()` syscall stub (the tick that was pending when IRQ0 got unmasked);
+`0x8000e6` is inside the busy-spin loop. Each was running at `CPL=3`, so the
+timer switched `ring3 → ring0` via `TSS.RSP0`, ran the handler, and `iretq`ed
+back. The handler only *records* these RIPs (it stays short); `sys_exit` prints
+them. See **Timer interrupts** below for how the benchmark stays tick-free while
+the spin loop gets preempted.
 
 `avg syscall latency` measures the full SYSCALL/SYSRETQ round-trip through
 the kernel's asm entry stub, the Rust dispatch table, and back to ring 3
@@ -237,8 +239,9 @@ blob (which ends in `hlt` with interrupts off) must run with `--no-irqchip`.
 
 1. **Remap the PIC.** The 8259 defaults to vectors 0x08–0x0F, which collide
    with the CPU's exception vectors. The ICW1–ICW4 init sequence moves IRQ0–7
-   to 0x20–0x27 (so the timer is vector 32), then OCW1 masks every line except
-   IRQ0.
+   to 0x20–0x27 (so the timer is vector 32), then OCW1 masks *every* line —
+   including IRQ0. The timer stays masked until ring 3 explicitly opts in (see
+   "Preempting ring 3" below).
 2. **Program the PIT.** Mode 2 (rate generator), divisor =
    `1193182 / 1000` → a ~1 kHz tick. The divisor math is a pure function,
    re-derived host-side in `crates/vmm/tests/pit_divisor.rs`.
@@ -246,28 +249,44 @@ blob (which ends in `hlt` with interrupts off) must run with `--no-irqchip`.
    that reuse the same `isr_common` save/restore path the exception stubs use;
    its epilogue (`pop`s, `add rsp,16`, `iretq`) was already built to *return*,
    which is exactly what an IRQ handler must do.
-4. **Handle + EOI.** `handle_timer` bumps an `AtomicU64`, prints the first few
-   ticks with the interrupted RIP, and sends the PIC end-of-interrupt (`out
-   0x20, 0x20`) — without the EOI the PIC never delivers IRQ0 again.
+4. **Handle + EOI.** `handle_timer` bumps an `AtomicU64`, records the first few
+   interrupted RIPs, and sends the PIC end-of-interrupt (`out 0x20, 0x20`) —
+   without the EOI the PIC never delivers IRQ0 again. It does **no** serial I/O
+   (see the top-half note below); `sys_exit` prints the RIPs.
 
-**Where the tick lands (and why it's kernel mode).** By the time `sti` runs,
-the PIT has been ticking since `init()` — and the handful of `writeln!`s in
-between are many COM1 VM-exits each, far more than one 1 ms period — so an
-IRQ0 is already latched in the PIC. `sti` therefore delivers it right away,
-except the x86 **interrupt shadow** grants one more instruction (`enable()`'s
-`ret`) before interrupts are recognized. The handler's saved RIP is thus the
-*next kernel instruction*, a few bytes into `kernel_main` — a **ring-0**
-interrupt, so there is no privilege change and no `TSS.RSP0` stack switch.
+**Preempting ring 3 (two gates, not one).** Whether a tick reaches the CPU
+depends on *two* independent switches: the `IF` flag (per-context) and the PIC
+mask (per-IRQ-line). This kernel keeps them separate so it can preempt user
+code without disturbing the syscall benchmark:
 
-This is deliberate: `enter_ring3` hands off with `IF=0`, so the 10 000-syscall
-latency benchmark in ring 3 runs uninterrupted and the measurement stays
-clean. That's why exactly one tick fires, in kernel mode, at the same RIP
-every run. Enabling `IF` in ring 3 would give a textbook user-code preemption
-(with the `TSS.RSP0` switch), but the printing IRQ handler would land in the
-middle of the benchmark and wreck it — so true ring-3 preemption waits for a
-slice with a long-running user workload. What this slice proves end-to-end is
-asynchronous delivery: IDT gate 32 → `isr_common` save → handler → EOI →
-`iretq`-resume, with the interrupted RIP captured as evidence.
+- `enter_ring3` hands off with **`IF=1`** (`rflags = 0x202`), so ring 3 is
+  preemptible. This is the *only* place interrupts get enabled — the kernel
+  itself never runs `sti`; the `iretq` into ring 3 is what turns `IF` on, right
+  at the privilege boundary.
+- But IRQ0 is **masked** at the PIC through boot *and* the benchmark, so nothing
+  actually fires. The 10 000-syscall latency loop runs interrupt-free and its
+  measurement stays clean.
+- After the benchmark, the user program calls **`SYS_PREEMPT`** (syscall 3),
+  whose handler unmasks IRQ0 (`out 0x21, 0xFE`). The user code then busy-spins,
+  and now every ~1 ms a timer tick lands *in that ring-3 loop*.
+
+Because the tick arrives at `CPL=3`, the CPU performs a privilege switch: it
+loads the kernel stack from **`TSS.RSP0`** (set up back in the GDT/TSS slice,
+exercised for real here), vectors through IDT gate 32, runs `handle_timer`,
+EOIs, and `iretq`s back to ring 3 with `IF` restored. The recorded RIPs are
+user-space addresses — the first (`0x80002c`) is the `preempt()` `ret` the
+pending tick caught on the way out of the syscall; the rest (`0x8000e6`, …) are
+inside the busy-spin loop. Those addresses being in the user program is the
+end-to-end proof that the timer genuinely preempted ring 3.
+
+**Why the handler prints nothing.** An interrupt handler must be *short*. The
+first version printed the RIP from inside `handle_timer`, but serial output is
+many COM1 VM-exits — slower than the 1 kHz tick — so the handler kept getting
+re-interrupted at the *same* return address before it could finish, and every
+"sample" was that one `ret`. Splitting it into a fast top half (record the RIP,
+EOI) and a bottom half (`sys_exit` prints them) fixes that: the handler returns
+immediately, so ticks 2+ land in the spin loop where the work actually is. The
+total is reported too (~tens of ticks; wall-clock-dependent).
 
 ## Language roles
 
@@ -298,7 +317,8 @@ some were superseded by later slices.
 - **M3 slice 6 — Benchmark + this README** → `[host] avg syscall latency: M ns`
 - **Slice 7 — GDB stub (post-PDF Tier C)** → `[host] gdb stub listening on 127.0.0.1:1234`
 - **Slice 8 — MMIO device emulation** → `[guest] host uptime via MMIO: N ns` + poweroff
-- **Slice 9 — Timer interrupts (in-kernel irqchip + PIT)** → `[guest] timer tick 1 (interrupted rip=0x…)`
+- **Slice 9 — Timer interrupts (in-kernel irqchip + PIT)** → `[guest] timer tick 1 (interrupted rip=0x…)` (fired in kernel mode)
+- **Slice 10 — Ring-3 preemption (PIC-mask gate + `SYS_PREEMPT`)** → `[guest] timer tick 1 (interrupted rip=0x80002c)` (a user address — real preemption + `TSS.RSP0`)
 
 ## Key lessons learned
 
