@@ -72,6 +72,17 @@ pub unsafe fn program_pit() {
     outb(PIT_CH0, (div >> 8) as u8);
 }
 
+/// Unmask IRQ0 (the PIT) at the master PIC, leaving every other line masked.
+/// After this call an `IF=1` context (i.e. ring 3) starts taking timer
+/// interrupts. Pairs with `remap_pic`, which masks IRQ0 initially so boot and
+/// the syscall benchmark run interrupt-free.
+///
+/// # Safety
+/// Port I/O to the (in-kernel) PIC; call after `remap_pic`.
+pub unsafe fn unmask_timer() {
+    outb(PIC1_DATA, 0xFE); // unmask only IRQ0 (bit 0 clear), keep IRQ1..7 masked
+}
+
 /// Remap the PIC and program the PIT. Call once after `idt::init()` and
 /// `gdt::init()`, with interrupts still disabled.
 ///
