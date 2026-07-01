@@ -131,7 +131,13 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
 fn sys_exit(code: u64) -> ! {
     let mut com = Serial;
     let _ = writeln!(com, "[guest] user exited (code {})", code);
-    let _ = writeln!(com, "[guest] handled {} timer ticks", crate::interrupts::tick_count());
+    let ticks = crate::interrupts::tick_count();
+    let rips = crate::interrupts::first_rips();
+    let _ = writeln!(
+        com,
+        "[guest] handled {} timer ticks; first ring-3 RIPs preempted: {:#x} {:#x} {:#x}",
+        ticks, rips[0], rips[1], rips[2],
+    );
     // Ask the host to power off (replaces hlt as the normal termination).
     // The VMM stops on this MMIO write, so the loop below is a defensive
     // fallback that runs only if poweroff were ever disabled.

@@ -4,14 +4,14 @@
 //! programs them: remap the PIC (IRQ0 → vector 0x20) with every line masked,
 //! set the PIT to 1 kHz, and expose `unmask_timer()`. Ring 3 runs with IF=1, so
 //! once the user program calls SYS_PREEMPT to unmask IRQ0, timer ticks preempt
-//! ring-3 code (ring3 → ring0 via TSS.RSP0). The handler counts ticks, prints
-//! the first few with the interrupted (user-space) RIP, and EOIs.
+//! ring-3 code (ring3 → ring0 via TSS.RSP0). The handler is a "top half": it
+//! only counts the tick and records the first few interrupted (user-space) RIPs,
+//! then EOIs — no serial I/O, since printing from the handler is slower than the
+//! 1 kHz tick and would re-preempt itself. `sys_exit` prints the recorded RIPs.
 
-use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::io::outb;
-use crate::serial::Serial;
 
 // 8259 PIC ports.
 const PIC1_CMD: u16 = 0x20;
@@ -26,9 +26,13 @@ const PIT_CMD: u16 = 0x43;
 const PIT_FREQ: u32 = 1_193_182; // input clock
 
 const TICK_HZ: u32 = 1000;
-const PRINT_FIRST_N: u64 = 3;
+const RIP_SAMPLES: usize = 3; // how many interrupted RIPs to record for the exit report
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+// Interrupted RIPs of the first RIP_SAMPLES ticks, recorded by the handler and
+// printed later by sys_exit (0 = not yet recorded).
+static FIRST_RIPS: [AtomicU64; RIP_SAMPLES] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// PIT reload divisor for `hz`, clamped to a valid 16-bit range. Pure — the
 /// host-side test `crates/vmm/tests/pit_divisor.rs` mirrors this and pins the
@@ -97,13 +101,14 @@ pub unsafe fn init() {
 
 /// Timer IRQ handler body (called from `rust_isr_dispatch` for vector 0x20).
 /// `rip` is the interrupted instruction pointer from the IRQ frame — a ring-3
-/// (user) address once SYS_PREEMPT has unmasked IRQ0. Counts the tick, prints
-/// the first few with their RIP, and EOIs the master PIC.
+/// (user) address once SYS_PREEMPT has unmasked IRQ0. Kept deliberately short:
+/// count the tick, stash the first few RIPs, EOI. No serial I/O here — a
+/// printing handler is slower than the 1 kHz tick and would just re-preempt
+/// itself at the same return address. `sys_exit` reports the RIPs afterwards.
 pub fn handle_timer(rip: u64) {
-    let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= PRINT_FIRST_N {
-        let mut com = Serial;
-        let _ = writeln!(com, "[guest] timer tick {} (interrupted rip={:#x})", n, rip);
+    let n = TICKS.fetch_add(1, Ordering::Relaxed); // 0-based index of this tick
+    if let Some(slot) = FIRST_RIPS.get(n as usize) {
+        slot.store(rip, Ordering::Relaxed);
     }
     // EOI BEFORE iretq so the PIC will deliver the next IRQ0.
     unsafe {
@@ -115,4 +120,16 @@ pub fn handle_timer(rip: u64) {
 /// the value is stable).
 pub fn tick_count() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// The interrupted RIPs of the first `RIP_SAMPLES` ticks (0 for any that didn't
+/// fire). Printed by `sys_exit` as the ring-3-preemption evidence.
+pub fn first_rips() -> [u64; RIP_SAMPLES] {
+    let mut out = [0u64; RIP_SAMPLES];
+    let mut i = 0;
+    while i < RIP_SAMPLES {
+        out[i] = FIRST_RIPS[i].load(Ordering::Relaxed);
+        i += 1;
+    }
+    out
 }

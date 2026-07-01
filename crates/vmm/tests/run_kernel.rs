@@ -39,10 +39,9 @@ fn kernel_boots_to_long_mode_and_prints() {
         "[guest] interrupts: PIC remapped",            // slice 9; (IRQ0 masked) tail added slice 10
         "[guest] loaded /bin/hello",                   // NEW (slice 5)
         "[guest] entering ring 3",
-        "[guest] timer tick 1 (interrupted rip=0x8",   // slice 10 — tick preempts RING-3 user code (0x8xxxxx); low bits vary
         "[user] hello from C userspace",               // NEW (slice 5; was "hello from ring 3")
         "[guest] user exited (code 0)",
-        "[guest] handled ",                            // NEW (slice 9) — tick total; count prefix only (host-timing-variable)
+        "timer ticks; first ring-3 RIPs preempted: 0x8", // slice 10 — tick total + a RING-3 user RIP (0x8xxxxx) = preemption proof
         "[host] guest powered off via MMIO",           // NEW (slice 8)
         "[host] avg syscall latency:",                 // NEW (slice 6) — prefix only; M ns is hardware-variable
         "hlt=0",                                        // slice 8: poweroff replaces hlt
