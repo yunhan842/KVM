@@ -66,23 +66,22 @@ hello from the kernel (long mode)
 [guest] loaded /bin/hello
 [guest] entering ring 3
 [user] hello from C userspace
-[guest] timer tick 1 (interrupted rip=0x80002c)
-[guest] timer tick 2 (interrupted rip=0x80002c)
-[guest] timer tick 3 (interrupted rip=0x80002c)
 [guest] user exited (code 0)
-[guest] handled 39 timer ticks
+[guest] handled 36 timer ticks; first ring-3 RIPs preempted: 0x80002c 0x8000e6 0x8000e6
 [host] guest powered off via MMIO
 [host] VM exits: io=1307, hlt=0, mmio=2
-[host] avg syscall latency: 64 ns
+[host] avg syscall latency: 63 ns
 [host] runtime: 49.059117ms
 ```
 
-The `timer tick N (interrupted rip=0x80…)` lines are the timer-interrupt proof:
-the PIT's IRQ0 fired while **ring-3 user code** was running (the captured RIP,
-`0x80002c`, is in the user program), so the timer genuinely preempted the
-program — switching `ring3 → ring0` via `TSS.RSP0`, running the handler, and
-`iretq`-ing back. See **Timer interrupts** below for how the benchmark stays
-tick-free while the spin loop gets preempted.
+The `RIPs preempted` line is the timer-interrupt proof: those are **ring-3
+user addresses** the PIT's IRQ0 interrupted. `0x80002c` is the `ret` of the
+`preempt()` syscall stub (the tick that was pending when IRQ0 got unmasked);
+`0x8000e6` is inside the busy-spin loop. Each was running at `CPL=3`, so the
+timer switched `ring3 → ring0` via `TSS.RSP0`, ran the handler, and `iretq`ed
+back. The handler only *records* these RIPs (it stays short); `sys_exit` prints
+them. See **Timer interrupts** below for how the benchmark stays tick-free while
+the spin loop gets preempted.
 
 `avg syscall latency` measures the full SYSCALL/SYSRETQ round-trip through
 the kernel's asm entry stub, the Rust dispatch table, and back to ring 3
@@ -250,9 +249,10 @@ blob (which ends in `hlt` with interrupts off) must run with `--no-irqchip`.
    that reuse the same `isr_common` save/restore path the exception stubs use;
    its epilogue (`pop`s, `add rsp,16`, `iretq`) was already built to *return*,
    which is exactly what an IRQ handler must do.
-4. **Handle + EOI.** `handle_timer` bumps an `AtomicU64`, prints the first few
-   ticks with the interrupted RIP, and sends the PIC end-of-interrupt (`out
-   0x20, 0x20`) — without the EOI the PIC never delivers IRQ0 again.
+4. **Handle + EOI.** `handle_timer` bumps an `AtomicU64`, records the first few
+   interrupted RIPs, and sends the PIC end-of-interrupt (`out 0x20, 0x20`) —
+   without the EOI the PIC never delivers IRQ0 again. It does **no** serial I/O
+   (see the top-half note below); `sys_exit` prints the RIPs.
 
 **Preempting ring 3 (two gates, not one).** Whether a tick reaches the CPU
 depends on *two* independent switches: the `IF` flag (per-context) and the PIC
@@ -273,11 +273,20 @@ code without disturbing the syscall benchmark:
 Because the tick arrives at `CPL=3`, the CPU performs a privilege switch: it
 loads the kernel stack from **`TSS.RSP0`** (set up back in the GDT/TSS slice,
 exercised for real here), vectors through IDT gate 32, runs `handle_timer`,
-EOIs, and `iretq`s back to ring 3 with `IF` restored. The captured RIP is a
-user-space address (`0x80002c`, inside the spin loop) — that address being in
-the user program is the end-to-end proof that the timer genuinely preempted it.
-The demo prints the first three ticks and reports the total (~tens, since the
-spin lasts ~tens of ms); the exact count is wall-clock-dependent.
+EOIs, and `iretq`s back to ring 3 with `IF` restored. The recorded RIPs are
+user-space addresses — the first (`0x80002c`) is the `preempt()` `ret` the
+pending tick caught on the way out of the syscall; the rest (`0x8000e6`, …) are
+inside the busy-spin loop. Those addresses being in the user program is the
+end-to-end proof that the timer genuinely preempted ring 3.
+
+**Why the handler prints nothing.** An interrupt handler must be *short*. The
+first version printed the RIP from inside `handle_timer`, but serial output is
+many COM1 VM-exits — slower than the 1 kHz tick — so the handler kept getting
+re-interrupted at the *same* return address before it could finish, and every
+"sample" was that one `ret`. Splitting it into a fast top half (record the RIP,
+EOI) and a bottom half (`sys_exit` prints them) fixes that: the handler returns
+immediately, so ticks 2+ land in the spin loop where the work actually is. The
+total is reported too (~tens of ticks; wall-clock-dependent).
 
 ## Language roles
 
