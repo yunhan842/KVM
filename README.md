@@ -318,7 +318,7 @@ some were superseded by later slices.
 - **Slice 7 — GDB stub (post-PDF Tier C)** → `[host] gdb stub listening on 127.0.0.1:1234`
 - **Slice 8 — MMIO device emulation** → `[guest] host uptime via MMIO: N ns` + poweroff
 - **Slice 9 — Timer interrupts (in-kernel irqchip + PIT)** → `[guest] timer tick 1 (interrupted rip=0x…)` (fired in kernel mode)
-- **Slice 10 — Ring-3 preemption (PIC-mask gate + `SYS_PREEMPT`)** → `[guest] timer tick 1 (interrupted rip=0x80002c)` (a user address — real preemption + `TSS.RSP0`)
+- **Slice 10 — Ring-3 preemption (PIC-mask gate + `SYS_PREEMPT`)** → `first ring-3 RIPs preempted: 0x80002c 0x8000e6 …` (user addresses — real preemption + `TSS.RSP0`)
 
 ## Key lessons learned
 
@@ -369,6 +369,58 @@ been invisible without slice 2's IDT or slice 4a's IST catching them:
   guest; the lesson is that one ioctl quietly rewires an instruction three
   layers away.
 
+## Why it's fast: a microVM postmortem
+
+A microVM trades a general-purpose machine's flexibility for cold-start speed:
+no firmware, no bootloader chain, no device probing, minimal emulation. This
+toy exhibits the same shape in miniature. Numbers below are 5-run means on the
+dev box (WSL2, **debug** build, single vCPU) — illustrative, not benchmark-grade
+(see the caveat at the end).
+
+| Metric | Value | What it says |
+|--------|-------|--------------|
+| `guest.img` | **69 KiB** (4 KiB boot stub + 66 KiB kernel, incl. a 21 KiB embedded C ELF) | the entire "disk" — no firmware image, no initrd |
+| Guest RAM | **64 MiB**, identity-mapped once | small and fixed; the page tables are built in one pass |
+| VM exits / run | **io ≈ 1133, mmio = 2, hlt = 0** | every serial *byte* is one `KVM_EXIT_IO`; MMIO = uptime read + poweroff |
+| 10 000 guest syscalls | **0 exits** | `SYSCALL`/`SYSRET` never leaves the guest |
+| Syscall latency | **~65 ns** | because it's an in-guest round trip, not a VM exit |
+| Runtime (`KVM_RUN` loop) | **~21 ms** boot + benchmark + console I/O; **~50–60 ms** with the deliberate ~35 ms preemption spin | even the 21 ms is mostly the ~1133 byte-at-a-time console exits, not computation |
+
+Three things fall out of these numbers:
+
+1. **Nothing sits between power-on and your code.** A real PC spends most of its
+   boot in firmware (POST, option ROMs), a bootloader, then a kernel enumerating
+   ACPI/PCI/USB. MiniKVM has none of that: the VMM loads a 69 KiB image, sets one
+   `KVM_SET_TSS_ADDR`, and drops the vCPU straight onto the 16-bit boot stub,
+   which climbs to long mode in a few dozen instructions. Boot *is* your kernel.
+
+2. **Exits are the only cost that matters.** Guest instructions run at native
+   speed — the 10 000-syscall benchmark causes **zero** VM exits, because
+   `SYSCALL` is handled entirely inside the guest. What the "runtime" actually
+   measures is I/O: ~1133 serial bytes, each a full round trip to the host, plus
+   the intentional busy-spin. Computation is nearly free; *crossing the
+   guest↔host boundary* is what you pay for. (This is also why the number is
+   noisy — pipe the output to a file and it drops; render it to a live terminal
+   and it climbs. The exit count even tracks how many digits the uptime has.)
+
+3. **Small and fixed beats general.** 64 MiB of RAM mapped in one shot, no
+   hotplug, no ballooning, one vCPU. There is almost no state to set up, which is
+   exactly why there is almost no time to spend setting it up.
+
+This is the [Firecracker](https://github.com/firecracker-microvm/firecracker)
+thesis at miniature scale. Firecracker boots a stripped Linux guest to
+userspace in ~100 ms by throwing away the same things we never added — no BIOS,
+a minimal virtio-only device model, a purpose-built VMM — so thousands of
+microVMs can be packed per host and started per second. MiniKVM won't run Linux,
+but it demonstrates *why* the approach is fast from the ioctl up: the cost of a
+VM is the boundary crossings you force it to make, and a microVM is the art of
+making as few as possible.
+
+**Caveat.** These are debug-build wall-clock numbers on WSL2 with one vCPU and
+console output going through a pipe; they wander several milliseconds run to run
+with host load, CPU-frequency scaling, and where stdout points. Treat them as
+"what dominates" evidence, not a leaderboard.
+
 ## References
 
 - **OSDev Wiki** — [osdev.org](https://wiki.osdev.org/) — x86_64 boot path,
@@ -380,15 +432,3 @@ been invisible without slice 2's IDT or slice 4a's IST catching them:
   `kvm-ioctls`, `kvm-bindings`, `vm-memory`.
 - **Linux KVM API docs** — [kernel.org/doc/html/latest/virt/kvm/api.html](https://kernel.org/doc/html/latest/virt/kvm/api.html)
 - **Firecracker** — [github.com/firecracker-microvm/firecracker](https://github.com/firecracker-microvm/firecracker)
-
-## Status
-
-Solo learning project, written May–June 2026. Pace was by milestones, not
-the calendar. Not production code.
-
-**Scope discipline** (locked from the start): single vCPU, no networking,
-no disk by design. Per-slice design rationale lives in a private notes
-tree and is not included in this clone.
-
-The repo directory is named `KVM/` for legacy reasons; the project name
-everywhere else is **MiniKVM** (mixed case).
